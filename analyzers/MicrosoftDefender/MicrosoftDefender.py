@@ -22,15 +22,6 @@ RISK_LEVEL_MAP = {
     "unknown": "safe",
 }
 
-AV_MODE_MAP = {
-    "0": "Active",
-    "1": "Passive",
-    "2": "SxS Passive Mode",
-    "4": "EDR Block Mode",
-    "100": "Not Reporting",
-    "none": "Unknown",
-}
-
 
 class MicrosoftDefenderAnalyzer(Analyzer):
     def __init__(self):
@@ -68,16 +59,28 @@ class MicrosoftDefenderAnalyzer(Analyzer):
     # HTTP helper
     # ------------------------------------------------------------------
 
-    def _get(self, path: str, params: dict = None) -> dict:
-        headers = {
+    def _headers(self) -> dict:
+        return {
             "Authorization": f"Bearer {self._get_token()}",
             "Accept": "application/json",
             "User-Agent": "strangebee-thehive/1.0",
         }
-        resp = requests.get(MDE_BASE_URL + path, headers=headers, params=params, timeout=30)
+
+    def _get(self, path: str, params: dict = None) -> dict:
+        resp = requests.get(MDE_BASE_URL + path, headers=self._headers(), params=params, timeout=30)
         if not (200 <= resp.status_code < 300):
             self.error(f"MDE API error on {path}: HTTP {resp.status_code} — {resp.text}")
         return resp.json()
+
+    def _get_optional(self, path: str, params: dict = None) -> dict:
+        """Like _get but returns {} on any non-2xx without failing the analysis."""
+        try:
+            resp = requests.get(MDE_BASE_URL + path, headers=self._headers(), params=params, timeout=30)
+            if 200 <= resp.status_code < 300:
+                return resp.json()
+        except Exception:
+            pass
+        return {}
 
     # ------------------------------------------------------------------
     # Device search strategies
@@ -114,25 +117,13 @@ class MicrosoftDefenderAnalyzer(Analyzer):
     # Supplementary data fetchers (graceful degradation on failure)
     # ------------------------------------------------------------------
 
-    def _get_health(self, machine_id: str) -> dict:
-        try:
-            return self._get(f"machines/{machine_id}/health")
-        except Exception:
-            return {}
-
     def _get_alerts(self, machine_id: str) -> list:
-        try:
-            data = self._get(f"machines/{machine_id}/alerts", params={"$filter": "status ne 'Resolved'"})
-            return data.get("value", [])
-        except Exception:
-            return []
+        data = self._get_optional(f"machines/{machine_id}/alerts", params={"$filter": "status ne 'Resolved'"})
+        return data.get("value", [])
 
     def _get_logon_users(self, machine_id: str) -> list:
-        try:
-            data = self._get(f"machines/{machine_id}/logonusers")
-            return data.get("value", [])
-        except Exception:
-            return []
+        data = self._get_optional(f"machines/{machine_id}/logonusers")
+        return data.get("value", [])
 
     # ------------------------------------------------------------------
     # Cortex entry points
@@ -149,13 +140,11 @@ class MicrosoftDefenderAnalyzer(Analyzer):
             machine = self._search_machine(observable)
             machine_id = machine["id"]
 
-            health = self._get_health(machine_id)
             alerts = self._get_alerts(machine_id)
             logon_users = self._get_logon_users(machine_id)
 
             self.report({
                 "machine": machine,
-                "health": health,
                 "alerts": alerts,
                 "logon_users": logon_users,
                 "active_alerts_count": len(alerts),
@@ -168,8 +157,7 @@ class MicrosoftDefenderAnalyzer(Analyzer):
     def summary(self, raw):
         taxonomies = []
         machine = raw.get("machine", {})
-        health = raw.get("health", {})
-        namespace = "XDR"
+        namespace = "MDE"
 
         def risk_level(value: str) -> str:
             return RISK_LEVEL_MAP.get((value or "none").lower(), "safe")
@@ -220,27 +208,6 @@ class MicrosoftDefenderAnalyzer(Analyzer):
         if len(mac_raw) >= 2:
             mac_fmt = ":".join(mac_raw[i:i + 2] for i in range(0, len(mac_raw), 2))
             add("MAC_Address", mac_fmt)
-
-        # AV / health details
-        av_mode_raw = str(health.get("avMode", "") or "")
-        av_mode_label = AV_MODE_MAP.get(av_mode_raw, av_mode_raw) if av_mode_raw else None
-        add("AV_Mode", av_mode_label)
-        add("AV_Version", health.get("avEngineVersion"))
-        add("Security_Intelligence_Version", health.get("avSignatureVersion"))
-        add("Platform_Version", health.get("avPlatformVersion"))
-
-        # Scan results
-        quick_time = health.get("quickScanTime")
-        quick_result = health.get("quickScanResult")
-        if quick_time or quick_result:
-            val = f"{quick_time} ({quick_result})" if quick_time and quick_result else (quick_time or quick_result)
-            add("Last_Quick_Scan", val)
-
-        full_time = health.get("fullScanTime")
-        full_result = health.get("fullScanResult")
-        if full_time or full_result:
-            val = f"{full_time} ({full_result})" if full_time and full_result else (full_time or full_result)
-            add("Last_Full_Scan", val)
 
         # Active alerts — color coded
         alert_count = raw.get("active_alerts_count", 0)
