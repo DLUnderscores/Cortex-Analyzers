@@ -1,0 +1,45 @@
+{
+    "name": "MicrosoftDefender_GetUserInfo",
+    "version": "1.0",
+    "author": "CySOC",
+    "url": "https://github.com/TheHive-Project/Cortex-Analyzers",
+    "license": "AGPL-V3",
+    "description": "Get user information from Microsoft Defender for Endpoint (MDE) by UPN/email, SAM account name, or Azure AD Object ID. Returns identity details, active alerts, and associated machines.",
+    "dataTypeList": ["mail", "username"],
+    "command": "MicrosoftDefender/MicrosoftDefender.py",
+    "baseConfig": "MicrosoftDefender",
+    "config": {
+        "check_tlp": false,
+        "max_tlp": 3
+    },
+    "configurationItems": [
+        {
+            "name": "tenant_id",
+            "description": "Azure AD Tenant ID",
+            "type": "string",
+            "multi": false,
+            "required": true,
+            "defaultValue": ""
+        },
+        {
+            "name": "client_id",
+            "description": "Azure AD Application (Client) ID — requires AdvancedQuery.Read.All, User.Read.All, Alert.Read.All, and Machine.Read.All permissions",
+            "type": "string",
+            "multi": false,
+            "required": true,
+            "defaultValue": ""
+        },
+        {
+            "name": "client_secret",
+            "description": "Azure AD Application Client Secret",
+            "type": "string",
+            "multi": false,
+            "required": true,
+            "defaultValue": ""
+        }
+    ],
+    "registration_required": true,
+    "subscription_required": true,
+    "free_subscription": false,
+    "service_homepage": "https://security.microsoft.com"
+}

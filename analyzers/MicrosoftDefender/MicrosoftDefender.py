@@ -12,6 +12,7 @@ MDE_TOKEN_URL = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token
 MDE_SCOPE = "https://api.securitycenter.microsoft.com/.default"
 
 IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+GUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
 RISK_LEVEL_MAP = {
     "critical": "malicious",
@@ -151,31 +152,66 @@ class MicrosoftDefenderAnalyzer(Analyzer):
         return data.get("value", [])
 
     # ------------------------------------------------------------------
+    # User search strategies
+    # ------------------------------------------------------------------
+
+    def _search_user(self, observable: str) -> dict:
+        """Find user via IdentityInfo Advanced Hunting. Handles UPN, SAM name, or Azure AD GUID."""
+        safe = observable.replace("'", "''")
+        if GUID_RE.match(observable):
+            query = f"IdentityInfo | where AccountObjectId =~ '{safe}' | take 1"
+        elif "@" in observable:
+            query = f"IdentityInfo | where AccountUpn =~ '{safe}' or EmailAddress =~ '{safe}' | take 1"
+        else:
+            query = f"IdentityInfo | where AccountName =~ '{safe}' | sort by Timestamp desc | take 1"
+        result = self._post_optional("advancedqueries/run", {"Query": query})
+        rows = result.get("Results", [])
+        if rows:
+            return rows[0]
+        self.error(f"No user found in MDE for observable: {observable}")
+
+    def _get_user_alerts(self, account_name: str) -> list:
+        data = self._get_optional(f"users/{account_name}/alerts", params={"$filter": "status ne 'Resolved'"})
+        return data.get("value", [])
+
+    def _get_user_machines(self, account_name: str) -> list:
+        data = self._get_optional(f"users/{account_name}/machines")
+        return data.get("value", [])
+
+    # ------------------------------------------------------------------
     # Cortex entry points
     # ------------------------------------------------------------------
 
     def run(self):
         Analyzer.run(self)
-        if self.data_type not in ("hostname", "fqdn", "ip"):
-            self.notSupported()
-            return
-
         try:
             observable = self.get_data().strip()
-            machine = self._search_machine(observable)
-            machine_id = machine["id"]
-
-            device_info = self._get_device_info(machine_id)
-            alerts = self._get_alerts(machine_id)
-            logon_users = self._get_logon_users(machine_id)
-
-            self.report({
-                "machine": machine,
-                "device_info": device_info,
-                "alerts": alerts,
-                "logon_users": logon_users,
-                "active_alerts_count": len(alerts),
-            })
+            if self.data_type in ("hostname", "fqdn", "ip"):
+                machine = self._search_machine(observable)
+                machine_id = machine["id"]
+                device_info = self._get_device_info(machine_id)
+                alerts = self._get_alerts(machine_id)
+                logon_users = self._get_logon_users(machine_id)
+                self.report({
+                    "machine": machine,
+                    "device_info": device_info,
+                    "alerts": alerts,
+                    "logon_users": logon_users,
+                    "active_alerts_count": len(alerts),
+                })
+            elif self.data_type in ("mail", "username"):
+                user = self._search_user(observable)
+                account_name = user.get("AccountName", "")
+                alerts = self._get_user_alerts(account_name)
+                machines = self._get_user_machines(account_name)
+                self.report({
+                    "user": user,
+                    "alerts": alerts,
+                    "machines": machines,
+                    "active_alerts_count": len(alerts),
+                })
+            else:
+                self.notSupported()
         except SystemExit:
             raise
         except Exception:
@@ -183,8 +219,6 @@ class MicrosoftDefenderAnalyzer(Analyzer):
 
     def summary(self, raw):
         taxonomies = []
-        machine = raw.get("machine", {})
-        device_info = raw.get("device_info", {})
         namespace = "MDE"
 
         def risk_level(value: str) -> str:
@@ -194,55 +228,83 @@ class MicrosoftDefenderAnalyzer(Analyzer):
             if value is not None and str(value) != "":
                 taxonomies.append(self.build_taxonomy(level, namespace, predicate, str(value)))
 
-        # Device ID
-        add("Device_ID", machine.get("id"))
+        machine = raw.get("machine", {})
+        user = raw.get("user", {})
 
-        # Color-coded risk/exposure
-        risk = machine.get("riskScore", "none")
-        add("Risk_Level", risk or "none", risk_level(risk))
+        if machine:
+            device_info = raw.get("device_info", {})
 
-        exposure = machine.get("exposureLevel", "none")
-        add("Exposure_Level", exposure or "none", risk_level(exposure))
+            # Device ID
+            add("Device_ID", machine.get("id"))
 
-        # OS
-        os_parts = [p for p in [machine.get("osPlatform"), str(machine.get("osBuild", "") or "")] if p]
-        add("OS", " ".join(os_parts) if os_parts else None)
+            # Color-coded risk/exposure
+            risk = machine.get("riskScore", "none")
+            add("Risk_Level", risk or "none", risk_level(risk))
 
-        # SAM name (short hostname)
-        dns_name = machine.get("computerDnsName", "")
-        add("SAM_Name", dns_name.split(".")[0] if dns_name else None)
+            exposure = machine.get("exposureLevel", "none")
+            add("Exposure_Level", exposure or "none", risk_level(exposure))
 
-        # Domain
-        add("Domain", machine.get("rbacGroupName") or machine.get("domainName"))
+            # OS
+            os_parts = [p for p in [machine.get("osPlatform"), str(machine.get("osBuild", "") or "")] if p]
+            add("OS", " ".join(os_parts) if os_parts else None)
 
-        # Device type — from Advanced Hunting DeviceInfo table
-        add("Device_Type", device_info.get("DeviceType"))
-        subtype = device_info.get("DeviceSubtype")
-        if subtype and subtype != device_info.get("DeviceType"):
-            add("Device_Subtype", subtype)
-        dynamic_tags = device_info.get("DeviceDynamicTags")
-        if dynamic_tags:
-            val = ", ".join(dynamic_tags) if isinstance(dynamic_tags, list) else str(dynamic_tags)
-            add("Device_Tags", val)
+            # SAM name (short hostname)
+            dns_name = machine.get("computerDnsName", "")
+            add("SAM_Name", dns_name.split(".")[0] if dns_name else None)
 
-        # Device health and onboarding
-        add("Health_Status", machine.get("healthStatus"))
-        add("Onboarding_Status", machine.get("onboardingStatus"))
+            # Domain
+            add("Domain", machine.get("rbacGroupName") or machine.get("domainName"))
 
-        # Timestamps
-        add("First_Seen", machine.get("firstSeen"))
-        add("Last_Seen", machine.get("lastSeen"))
+            # Device type — from Advanced Hunting DeviceInfo table
+            add("Device_Type", device_info.get("DeviceType"))
+            subtype = device_info.get("DeviceSubtype")
+            if subtype and subtype != device_info.get("DeviceType"):
+                add("Device_Subtype", subtype)
+            dynamic_tags = device_info.get("DeviceDynamicTags")
+            if dynamic_tags:
+                val = ", ".join(dynamic_tags) if isinstance(dynamic_tags, list) else str(dynamic_tags)
+                add("Device_Tags", val)
 
-        add("Last_Internal_IP", machine.get("lastIpAddress"))
-        add("Last_External_IP", machine.get("lastExternalIpAddress"))
+            # Device health and onboarding
+            add("Health_Status", machine.get("healthStatus"))
+            add("Onboarding_Status", machine.get("onboardingStatus"))
 
-        # MAC address — MDE returns without separators, insert colons
-        mac_raw = machine.get("macAddress", "") or ""
-        if len(mac_raw) >= 2:
-            mac_fmt = ":".join(mac_raw[i:i + 2] for i in range(0, len(mac_raw), 2))
-            add("MAC_Address", mac_fmt)
+            # Timestamps
+            add("First_Seen", machine.get("firstSeen"))
+            add("Last_Seen", machine.get("lastSeen"))
 
-        # Active alerts — color coded
+            add("Last_Internal_IP", machine.get("lastIpAddress"))
+            add("Last_External_IP", machine.get("lastExternalIpAddress"))
+
+            # MAC address — MDE returns without separators, insert colons
+            mac_raw = machine.get("macAddress", "") or ""
+            if len(mac_raw) >= 2:
+                mac_fmt = ":".join(mac_raw[i:i + 2] for i in range(0, len(mac_raw), 2))
+                add("MAC_Address", mac_fmt)
+
+        elif user:
+            add("UPN", user.get("AccountUpn"))
+            add("Display_Name", user.get("DisplayName"))
+            add("Department", user.get("Department"))
+            add("Job_Title", user.get("JobTitle"))
+
+            enabled = user.get("IsAccountEnabled")
+            if enabled is not None:
+                add("Account_Enabled", "Yes" if enabled else "No", "safe" if enabled else "warning")
+
+            priority = user.get("InvestigationPriority")
+            if priority is not None:
+                p_level = "malicious" if priority > 80 else "suspicious" if priority > 50 else "info"
+                add("Risk_Score", priority, p_level)
+
+            account_tags = user.get("AccountTags")
+            if account_tags:
+                val = ", ".join(account_tags) if isinstance(account_tags, list) else str(account_tags)
+                add("Account_Tags", val)
+
+            add("Machine_Count", len(raw.get("machines", [])))
+
+        # Active alerts — color coded (shared between device and user paths)
         alert_count = raw.get("active_alerts_count", 0)
         alert_level = "malicious" if alert_count > 5 else "suspicious" if alert_count > 0 else "safe"
         taxonomies.append(self.build_taxonomy(alert_level, namespace, "Active_Alerts", alert_count))
@@ -251,35 +313,57 @@ class MicrosoftDefenderAnalyzer(Analyzer):
 
     def artifacts(self, raw):
         artifacts = []
-        machine = raw.get("machine", {})
         input_lower = self.get_data().strip().lower()
+        machine = raw.get("machine", {})
+        user = raw.get("user", {})
 
-        # All IPs → new ip observables
-        ip_set = set()
-        if machine.get("lastIpAddress"):
-            ip_set.add(machine["lastIpAddress"])
-        for entry in machine.get("ipAddresses", []):
-            ip = entry.get("ipAddress", "")
-            if ip:
-                ip_set.add(ip)
+        if machine:
+            # All IPs → new ip observables
+            ip_set = set()
+            if machine.get("lastIpAddress"):
+                ip_set.add(machine["lastIpAddress"])
+            for entry in machine.get("ipAddresses", []):
+                ip = entry.get("ipAddress", "")
+                if ip:
+                    ip_set.add(ip)
 
-        dns_name = machine.get("computerDnsName", "")
-        for ip in ip_set:
-            if ip.lower() != input_lower:
-                artifacts.append(self.build_artifact("ip", ip, tags=["MicrosoftDefender", f"device={dns_name}"]))
+            dns_name = machine.get("computerDnsName", "")
+            for ip in ip_set:
+                if ip.lower() != input_lower:
+                    artifacts.append(self.build_artifact("ip", ip, tags=["MicrosoftDefender", f"device={dns_name}"]))
 
-        # Full FQDN → fqdn observable
-        if dns_name and "." in dns_name and dns_name.lower() != input_lower:
-            artifacts.append(self.build_artifact("fqdn", dns_name, tags=["MicrosoftDefender"]))
+            # Full FQDN → fqdn observable
+            if dns_name and "." in dns_name and dns_name.lower() != input_lower:
+                artifacts.append(self.build_artifact("fqdn", dns_name, tags=["MicrosoftDefender"]))
 
-        # Logged-on users → mail observables
-        for user in raw.get("logon_users", []):
-            account = user.get("accountName", "")
-            domain = user.get("domainName", "")
-            if account and domain:
-                artifacts.append(
-                    self.build_artifact("mail", f"{account}@{domain}", tags=["MicrosoftDefender", "logon_user"])
-                )
+            # Logged-on users → mail observables
+            for logon_user in raw.get("logon_users", []):
+                account = logon_user.get("accountName", "")
+                domain = logon_user.get("domainName", "")
+                if account and domain:
+                    artifacts.append(
+                        self.build_artifact("mail", f"{account}@{domain}", tags=["MicrosoftDefender", "logon_user"])
+                    )
+
+        elif user:
+            account_name = user.get("AccountName", "")
+
+            # UPN → mail observable (when input is not already a mail)
+            upn = user.get("AccountUpn", "")
+            if upn and self.data_type != "mail" and upn.lower() != input_lower:
+                artifacts.append(self.build_artifact("mail", upn, tags=["MicrosoftDefender"]))
+
+            # AccountName → username observable (when input is not already a username)
+            if account_name and self.data_type != "username" and account_name.lower() != input_lower:
+                artifacts.append(self.build_artifact("username", account_name, tags=["MicrosoftDefender"]))
+
+            # Associated machine FQDNs → fqdn observables
+            for m in raw.get("machines", []):
+                dns_name = m.get("computerDnsName", "")
+                if dns_name and "." in dns_name:
+                    artifacts.append(
+                        self.build_artifact("fqdn", dns_name, tags=["MicrosoftDefender", f"user={account_name}"])
+                    )
 
         return artifacts
 
