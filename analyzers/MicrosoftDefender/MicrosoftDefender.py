@@ -82,6 +82,17 @@ class MicrosoftDefenderAnalyzer(Analyzer):
             pass
         return {}
 
+    def _post_optional(self, path: str, body: dict) -> dict:
+        """POST to MDE API, returns {} on any failure without failing the analysis."""
+        try:
+            headers = {**self._headers(), "Content-Type": "application/json"}
+            resp = requests.post(MDE_BASE_URL + path, headers=headers, json=body, timeout=30)
+            if 200 <= resp.status_code < 300:
+                return resp.json()
+        except Exception:
+            pass
+        return {}
+
     # ------------------------------------------------------------------
     # Device search strategies
     # ------------------------------------------------------------------
@@ -117,6 +128,14 @@ class MicrosoftDefenderAnalyzer(Analyzer):
     # Supplementary data fetchers (graceful degradation on failure)
     # ------------------------------------------------------------------
 
+    def _get_device_info(self, machine_id: str) -> dict:
+        """Fetch DeviceType and DeviceCategory via Advanced Hunting (requires AdvancedQuery.Read.All)."""
+        safe_id = machine_id.replace("'", "''")
+        query = f"DeviceInfo | where DeviceId == '{safe_id}' | project DeviceType, DeviceCategory | take 1"
+        result = self._post_optional("advancedqueries/run", {"Query": query})
+        rows = result.get("Results", [])
+        return rows[0] if rows else {}
+
     def _get_alerts(self, machine_id: str) -> list:
         data = self._get_optional(f"machines/{machine_id}/alerts", params={"$filter": "status ne 'Resolved'"})
         return data.get("value", [])
@@ -140,11 +159,13 @@ class MicrosoftDefenderAnalyzer(Analyzer):
             machine = self._search_machine(observable)
             machine_id = machine["id"]
 
+            device_info = self._get_device_info(machine_id)
             alerts = self._get_alerts(machine_id)
             logon_users = self._get_logon_users(machine_id)
 
             self.report({
                 "machine": machine,
+                "device_info": device_info,
                 "alerts": alerts,
                 "logon_users": logon_users,
                 "active_alerts_count": len(alerts),
@@ -157,6 +178,7 @@ class MicrosoftDefenderAnalyzer(Analyzer):
     def summary(self, raw):
         taxonomies = []
         machine = raw.get("machine", {})
+        device_info = raw.get("device_info", {})
         namespace = "MDE"
 
         def risk_level(value: str) -> str:
@@ -184,6 +206,10 @@ class MicrosoftDefenderAnalyzer(Analyzer):
         # Domain
         add("Domain", machine.get("rbacGroupName") or machine.get("domainName"))
 
+        # Device type — from Advanced Hunting DeviceInfo table
+        add("Device_Type", device_info.get("DeviceType"))
+        add("Device_Category", device_info.get("DeviceCategory"))
+
         # Device health and onboarding
         add("Health_Status", machine.get("healthStatus"))
         add("Onboarding_Status", machine.get("onboardingStatus"))
@@ -192,16 +218,8 @@ class MicrosoftDefenderAnalyzer(Analyzer):
         add("First_Seen", machine.get("firstSeen"))
         add("Last_Seen", machine.get("lastSeen"))
 
-        # IP addresses — collect from all sources, deduplicate
-        ip_set = set()
-        if machine.get("lastIpAddress"):
-            ip_set.add(machine["lastIpAddress"])
-        for entry in machine.get("ipAddresses", []):
-            ip = entry.get("ipAddress")
-            if ip:
-                ip_set.add(ip)
-        if ip_set:
-            add("IP_Addresses", ", ".join(sorted(ip_set)))
+        add("Last_Internal_IP", machine.get("lastIpAddress"))
+        add("Last_External_IP", machine.get("lastExternalIpAddress"))
 
         # MAC address — MDE returns without separators, insert colons
         mac_raw = machine.get("macAddress", "") or ""
