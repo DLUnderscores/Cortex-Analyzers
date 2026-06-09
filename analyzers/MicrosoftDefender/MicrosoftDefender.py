@@ -129,12 +129,18 @@ class MicrosoftDefenderAnalyzer(Analyzer):
     # ------------------------------------------------------------------
 
     def _get_device_info(self, machine_id: str) -> dict:
-        """Fetch DeviceType and DeviceCategory via Advanced Hunting (requires AdvancedQuery.Read.All)."""
+        """Fetch DeviceType, DeviceCategory and Tags via Advanced Hunting (requires AdvancedQuery.Read.All)."""
         safe_id = machine_id.replace("'", "''")
-        query = f"DeviceInfo | where DeviceId == '{safe_id}' | project DeviceType, DeviceCategory | take 1"
-        result = self._post_optional("advancedqueries/run", {"Query": query})
-        rows = result.get("Results", [])
-        return rows[0] if rows else {}
+        query = f"DeviceInfo | where DeviceId == '{safe_id}' | project DeviceType, DeviceSubtype, DeviceDynamicTags | take 1"
+        try:
+            headers = {**self._headers(), "Content-Type": "application/json"}
+            resp = requests.post(MDE_BASE_URL + "advancedqueries/run", headers=headers, json={"Query": query}, timeout=30)
+            if 200 <= resp.status_code < 300:
+                rows = resp.json().get("Results", [])
+                return rows[0] if rows else {}
+            return {"_error": f"HTTP {resp.status_code}", "_body": resp.text[:500]}
+        except Exception as e:
+            return {"_error": str(e)}
 
     def _get_alerts(self, machine_id: str) -> list:
         data = self._get_optional(f"machines/{machine_id}/alerts", params={"$filter": "status ne 'Resolved'"})
@@ -188,6 +194,9 @@ class MicrosoftDefenderAnalyzer(Analyzer):
             if value is not None and str(value) != "":
                 taxonomies.append(self.build_taxonomy(level, namespace, predicate, str(value)))
 
+        # Device ID
+        add("Device_ID", machine.get("id"))
+
         # Color-coded risk/exposure
         risk = machine.get("riskScore", "none")
         add("Risk_Level", risk or "none", risk_level(risk))
@@ -208,7 +217,13 @@ class MicrosoftDefenderAnalyzer(Analyzer):
 
         # Device type — from Advanced Hunting DeviceInfo table
         add("Device_Type", device_info.get("DeviceType"))
-        add("Device_Category", device_info.get("DeviceCategory"))
+        subtype = device_info.get("DeviceSubtype")
+        if subtype and subtype != device_info.get("DeviceType"):
+            add("Device_Subtype", subtype)
+        dynamic_tags = device_info.get("DeviceDynamicTags")
+        if dynamic_tags:
+            val = ", ".join(dynamic_tags) if isinstance(dynamic_tags, list) else str(dynamic_tags)
+            add("Device_Tags", val)
 
         # Device health and onboarding
         add("Health_Status", machine.get("healthStatus"))
