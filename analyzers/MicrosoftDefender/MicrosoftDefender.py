@@ -11,6 +11,10 @@ MDE_BASE_URL = "https://api.securitycenter.microsoft.com/api/"
 MDE_TOKEN_URL = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
 MDE_SCOPE = "https://api.securitycenter.microsoft.com/.default"
 
+# Microsoft 365 Defender (unified) — required for cross-product tables like IdentityInfo
+M365_BASE_URL = "https://api.security.microsoft.com/api/"
+M365_SCOPE = "https://api.security.microsoft.com/.default"
+
 IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 GUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
@@ -31,6 +35,7 @@ class MicrosoftDefenderAnalyzer(Analyzer):
         self.client_id = self.get_param("config.client_id", None, "MDE Client ID is missing")
         self.client_secret = self.get_param("config.client_secret", None, "MDE Client Secret is missing")
         self._token: Optional[str] = None
+        self._m365_token: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Authentication
@@ -39,22 +44,30 @@ class MicrosoftDefenderAnalyzer(Analyzer):
     def _get_token(self) -> str:
         if self._token is not None:
             return self._token
+        self._token = self._fetch_token(MDE_SCOPE)
+        return self._token
 
+    def _get_m365_token(self) -> str:
+        if self._m365_token is not None:
+            return self._m365_token
+        self._m365_token = self._fetch_token(M365_SCOPE)
+        return self._m365_token
+
+    def _fetch_token(self, scope: str) -> str:
         url = MDE_TOKEN_URL.format(tenant_id=self.tenant_id)
         payload = {
             "grant_type": "client_credentials",
             "client_id": self.client_id,
             "client_secret": self.client_secret,
-            "scope": MDE_SCOPE,
+            "scope": scope,
         }
         resp = requests.post(url, data=payload, timeout=30)
         if resp.status_code != 200:
-            self.error(f"MDE OAuth2 token request failed (HTTP {resp.status_code}): {resp.text}")
-
-        self._token = resp.json().get("access_token")
-        if not self._token:
-            self.error("MDE OAuth2 response contained no access_token")
-        return self._token
+            self.error(f"OAuth2 token request failed for {scope} (HTTP {resp.status_code}): {resp.text}")
+        token = resp.json().get("access_token")
+        if not token:
+            self.error(f"OAuth2 response contained no access_token for {scope}")
+        return token
 
     # ------------------------------------------------------------------
     # HTTP helper
@@ -88,6 +101,22 @@ class MicrosoftDefenderAnalyzer(Analyzer):
         try:
             headers = {**self._headers(), "Content-Type": "application/json"}
             resp = requests.post(MDE_BASE_URL + path, headers=headers, json=body, timeout=30)
+            if 200 <= resp.status_code < 300:
+                return resp.json()
+        except Exception:
+            pass
+        return {}
+
+    def _post_m365_optional(self, path: str, body: dict) -> dict:
+        """POST to M365 Defender API (supports cross-product tables like IdentityInfo)."""
+        try:
+            headers = {
+                "Authorization": f"Bearer {self._get_m365_token()}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "strangebee-thehive/1.0",
+            }
+            resp = requests.post(M365_BASE_URL + path, headers=headers, json=body, timeout=30)
             if 200 <= resp.status_code < 300:
                 return resp.json()
         except Exception:
@@ -156,7 +185,7 @@ class MicrosoftDefenderAnalyzer(Analyzer):
     # ------------------------------------------------------------------
 
     def _search_user(self, observable: str) -> dict:
-        """Find user via IdentityInfo Advanced Hunting. Handles UPN, SAM name, or Azure AD GUID."""
+        """Find user via IdentityInfo in the M365 Defender API (cross-product hunting, supports IdentityInfo)."""
         safe = observable.replace("'", "''")
         if GUID_RE.match(observable):
             query = f"IdentityInfo | where AccountObjectId =~ '{safe}' | take 1"
@@ -164,8 +193,7 @@ class MicrosoftDefenderAnalyzer(Analyzer):
             query = f"IdentityInfo | where AccountUpn =~ '{safe}' or EmailAddress =~ '{safe}' | take 1"
         else:
             query = f"IdentityInfo | where AccountName =~ '{safe}' | sort by Timestamp desc | take 1"
-        result = self._post_optional("advancedqueries/run", {"Query": query})
-        rows = result.get("Results", [])
+        rows = self._post_m365_optional("advancedhunting/run", {"Query": query}).get("Results", [])
         if rows:
             return rows[0]
         self.error(f"No user found in MDE for observable: {observable}")
@@ -209,6 +237,7 @@ class MicrosoftDefenderAnalyzer(Analyzer):
                     "alerts": alerts,
                     "machines": machines,
                     "active_alerts_count": len(alerts),
+                    "tenant_id": self.tenant_id,
                 })
             else:
                 self.notSupported()
@@ -284,7 +313,10 @@ class MicrosoftDefenderAnalyzer(Analyzer):
 
         elif user:
             add("UPN", user.get("AccountUpn"))
-            add("Display_Name", user.get("DisplayName"))
+            add("Display_Name", user.get("AccountDisplayName"))
+            add("Account_Domain", user.get("AccountDomain"))
+            add("Account_Object_ID", user.get("AccountObjectId"))
+            add("OnPrem_Object_ID", user.get("OnPremObjectId"))
             add("Department", user.get("Department"))
             add("Job_Title", user.get("JobTitle"))
 
@@ -292,15 +324,21 @@ class MicrosoftDefenderAnalyzer(Analyzer):
             if enabled is not None:
                 add("Account_Enabled", "Yes" if enabled else "No", "safe" if enabled else "warning")
 
-            priority = user.get("InvestigationPriority")
-            if priority is not None:
-                p_level = "malicious" if priority > 80 else "suspicious" if priority > 50 else "info"
-                add("Risk_Score", priority, p_level)
+            risk_score = user.get("RiskScore")
+            if risk_score is not None:
+                rs_level = "malicious" if risk_score > 80 else "suspicious" if risk_score > 50 else "info"
+                add("Risk_Score", risk_score, rs_level)
 
-            account_tags = user.get("AccountTags")
-            if account_tags:
-                val = ", ".join(account_tags) if isinstance(account_tags, list) else str(account_tags)
-                add("Account_Tags", val)
+            criticality = user.get("CriticalityLevel")
+            if criticality:
+                crit_map = {1: "Low", 2: "Medium", 3: "High", 4: "Critical"}
+                crit_level = "malicious" if criticality >= 3 else "suspicious" if criticality == 2 else "info"
+                add("Criticality", crit_map.get(criticality, str(criticality)), crit_level)
+
+            tags = user.get("Tags")
+            if tags:
+                val = ", ".join(tags) if isinstance(tags, list) else str(tags)
+                add("Tags", val)
 
             add("Machine_Count", len(raw.get("machines", [])))
 
