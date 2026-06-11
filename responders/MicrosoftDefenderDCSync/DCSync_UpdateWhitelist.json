@@ -1,0 +1,58 @@
+{
+    "name": "DCSync_UpdateWhitelist",
+    "version": "1.0",
+    "author": "CySOC",
+    "url": "https://github.com/TheHive-Project/Cortex-Analyzers",
+    "license": "AGPL-V3",
+    "description": "Add the user+host pair(s) of a DCSync case to the whitelist stored in Consul KV. Stable identifiers (Microsoft Defender device id, directory object id) are read from the MicrosoftDefender enrichment analyzer reports attached to the observables, so different spellings of the same user/host never create duplicate entries. Fails when an observable lacks enrichment. Run by the analyst when a true positive is rejected at the final verification step.",
+    "dataTypeList": [
+        "thehive:case"
+    ],
+    "command": "MicrosoftDefenderDCSync/dcsync_whitelist.py",
+    "baseConfig": "MicrosoftDefenderDCSync",
+    "config": {
+        "service": "update"
+    },
+    "configurationItems": [
+        {
+            "name": "thehive_url",
+            "description": "TheHive base URL",
+            "type": "string",
+            "multi": false,
+            "required": true,
+            "defaultValue": ""
+        },
+        {
+            "name": "thehive_api_key",
+            "description": "TheHive API key with permission to read observables",
+            "type": "string",
+            "multi": false,
+            "required": true,
+            "defaultValue": ""
+        },
+        {
+            "name": "consul_url",
+            "description": "Consul HTTP API base URL",
+            "type": "string",
+            "multi": false,
+            "required": true,
+            "defaultValue": "http://consul.service.consul:8500"
+        },
+        {
+            "name": "consul_kv_prefix",
+            "description": "Consul KV prefix holding the whitelist entries",
+            "type": "string",
+            "multi": false,
+            "required": true,
+            "defaultValue": ""
+        },
+        {
+            "name": "consul_token",
+            "description": "Consul ACL token (optional)",
+            "type": "string",
+            "multi": false,
+            "required": false,
+            "defaultValue": ""
+        }
+    ]
+}
