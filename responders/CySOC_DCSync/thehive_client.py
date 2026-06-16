@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # encoding: utf-8
 """Minimal TheHive 4 API client used by the DCSync whitelist responders."""
+from typing import Optional
+
 import requests
 
 
@@ -143,7 +145,35 @@ class TheHiveClient:
         if not (200 <= resp.status_code < 300):
             raise TheHiveError(f"Failed to write log to task {task_id}: HTTP {resp.status_code} — {resp.text}")
 
+    def get_last_task_log_message(self, task_id: str) -> Optional[str]:
+        body = {
+            "query": [
+                {"_name": "getTask", "idOrName": task_id},
+                {"_name": "logs"},
+                {"_name": "sort", "_fields": [{"_createdAt": "desc"}]},
+                {"_name": "page", "from": 0, "to": 1},
+            ]
+        }
+        resp = self.http.post(
+            f"{self.url}/api/v1/query",
+            params={"name": "task-logs"},
+            headers=self.headers,
+            json=body,
+            verify=self.verify,
+            timeout=30,
+        )
+        if not (200 <= resp.status_code < 300):
+            raise TheHiveError(f"Failed to fetch logs for task {task_id}: HTTP {resp.status_code} — {resp.text}")
+        entries = resp.json() or []
+        return entries[0].get("message") if entries else None
+
     def log_to_task(self, case_id: str, group: str, title: str, message: str) -> None:
-        """Find-or-create the (group, title) task on the case and append a log entry to it."""
+        """Find-or-create the (group, title) task on the case and append a log entry to it.
+
+        Skipped if it would be an exact duplicate of the task's most recent entry, so re-running
+        a job that lands on the same verdict doesn't spam the task with repeated identical lines.
+        """
         task_id = self.get_or_create_task(case_id, group, title)
+        if self.get_last_task_log_message(task_id) == message:
+            return
         self.add_task_log(task_id, message)

@@ -63,14 +63,25 @@ class DCSyncWhitelistResponder(Responder):
         except TheHiveError:
             pass
 
+    def _log_failure(self, thehive, case_id, message):
+        """Best-effort: only possible once a case/TheHive client is known, so it's a no-op before that."""
+        if case_id and thehive:
+            self._log(thehive, case_id, f"DCSync {self.service}: FAILED — {message}")
+
+    def _fail(self, thehive, case_id, message):
+        self._log_failure(thehive, case_id, message)
+        self.error(message)
+
     def run(self):
+        case_id = None
+        thehive = None
         try:
             case = self.get_data()
             if not isinstance(case, dict):
-                self.error(f"Expected a case object, got: {type(case).__name__}")
+                self._fail(thehive, case_id, f"Expected a case object, got: {type(case).__name__}")
             case_id = case.get("_id") or case.get("id")
             if not case_id:
-                self.error("Case id is missing from responder input")
+                self._fail(thehive, case_id, "Case id is missing from responder input")
 
             thehive = self._thehive()
             observables = thehive.get_case_observables(case_id)
@@ -78,10 +89,12 @@ class DCSyncWhitelistResponder(Responder):
 
             if unresolved:
                 details = "; ".join(f"{u['dataType']} '{u['data']}' ({u['reason']})" for u in unresolved)
-                self.error(f"Cannot evaluate case {case_id} — unresolved observables: {details}")
+                self._fail(thehive, case_id, f"Cannot evaluate case {case_id} — unresolved observables: {details}")
             if not pairs:
-                self.error(
-                    f"Cannot evaluate case {case_id} — no user+host pair could be derived from the case observables"
+                self._fail(
+                    thehive,
+                    case_id,
+                    f"Cannot evaluate case {case_id} — no user+host pair could be derived from the case observables",
                 )
 
             if self.service == "check":
@@ -89,16 +102,17 @@ class DCSyncWhitelistResponder(Responder):
                 self.check(case, case_id, thehive, whitelist, pairs, pair_selection)
             elif self.service == "update":
                 if not self.consul_kv_whitelist:
-                    self.error("Consul KV whitelist key is missing")
+                    self._fail(thehive, case_id, "Consul KV whitelist key is missing")
                 self.update(case, case_id, thehive, self._whitelist(), pairs, pair_selection)
             else:
-                self.error(f"Unknown service: {self.service}")
+                self._fail(thehive, case_id, f"Unknown service: {self.service}")
         except (TheHiveError, ConsulKVError) as exc:
-            self.error(str(exc))
+            self._fail(thehive, case_id, str(exc))
         except SystemExit:
             raise
-        except Exception:
-            self.unexpectedError(traceback.format_exc())
+        except Exception as exc:
+            self._log_failure(thehive, case_id, f"unexpected error: {exc}")
+            self.error(traceback.format_exc())
 
     def check(self, case, case_id, thehive, whitelist, pairs, pair_selection):
         entries = whitelist.entries() if whitelist else {}

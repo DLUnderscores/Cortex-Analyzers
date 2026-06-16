@@ -7,6 +7,15 @@ CASE_ID = "~4128"
 TASK_ID = "~9001"
 
 
+def query_router(**responses):
+    """Dispatch /api/v1/query calls to a canned response based on the `name` query param."""
+
+    def _route(**kwargs):
+        return responses[kwargs["params"]["name"]]
+
+    return _route
+
+
 def test_close_case_false_positive_never_touches_summary(fake_http):
     fake_http.route("PATCH", f"/api/case/{CASE_ID}", FakeResponse(200, {}))
     client = TheHiveClient("http://thehive", "key", http=fake_http)
@@ -100,11 +109,30 @@ def test_add_task_log_raises_on_error(fake_http):
         client.add_task_log(TASK_ID, "hello")
 
 
+def test_get_last_task_log_message_returns_most_recent(fake_http):
+    fake_http.route("POST", "/api/v1/query", FakeResponse(200, [{"message": "latest"}, {"message": "older"}]))
+    client = TheHiveClient("http://thehive", "key", http=fake_http)
+
+    assert client.get_last_task_log_message(TASK_ID) == "latest"
+
+
+def test_get_last_task_log_message_returns_none_when_no_logs(fake_http):
+    fake_http.route("POST", "/api/v1/query", FakeResponse(200, []))
+    client = TheHiveClient("http://thehive", "key", http=fake_http)
+
+    assert client.get_last_task_log_message(TASK_ID) is None
+
+
 def test_log_to_task_finds_task_then_logs(fake_http):
     fake_http.route(
         "POST",
         "/api/v1/query",
-        FakeResponse(200, [{"_id": TASK_ID, "group": "CySOC", "title": "Log", "status": "Completed"}]),
+        query_router(
+            **{
+                "case-tasks": FakeResponse(200, [{"_id": TASK_ID, "group": "CySOC", "title": "Log", "status": "Completed"}]),
+                "task-logs": FakeResponse(200, []),
+            }
+        ),
     )
     fake_http.route("POST", f"/api/case/task/{TASK_ID}/log", FakeResponse(200, {}))
     client = TheHiveClient("http://thehive", "key", http=fake_http)
@@ -113,3 +141,41 @@ def test_log_to_task_finds_task_then_logs(fake_http):
 
     log_calls = [c for c in fake_http.calls if c["url"].endswith(f"{TASK_ID}/log")]
     assert log_calls[0]["json"] == {"message": "hello"}
+
+
+def test_log_to_task_skips_exact_duplicate_of_last_message(fake_http):
+    fake_http.route(
+        "POST",
+        "/api/v1/query",
+        query_router(
+            **{
+                "case-tasks": FakeResponse(200, [{"_id": TASK_ID, "group": "CySOC", "title": "Log", "status": "Completed"}]),
+                "task-logs": FakeResponse(200, [{"message": "hello"}]),
+            }
+        ),
+    )
+    client = TheHiveClient("http://thehive", "key", http=fake_http)
+
+    client.log_to_task(CASE_ID, "CySOC", "Log", "hello")
+
+    assert not any(c["url"].endswith(f"{TASK_ID}/log") for c in fake_http.calls)
+
+
+def test_log_to_task_writes_when_different_from_last(fake_http):
+    fake_http.route(
+        "POST",
+        "/api/v1/query",
+        query_router(
+            **{
+                "case-tasks": FakeResponse(200, [{"_id": TASK_ID, "group": "CySOC", "title": "Log", "status": "Completed"}]),
+                "task-logs": FakeResponse(200, [{"message": "previous message"}]),
+            }
+        ),
+    )
+    fake_http.route("POST", f"/api/case/task/{TASK_ID}/log", FakeResponse(200, {}))
+    client = TheHiveClient("http://thehive", "key", http=fake_http)
+
+    client.log_to_task(CASE_ID, "CySOC", "Log", "new message")
+
+    log_calls = [c for c in fake_http.calls if c["url"].endswith(f"{TASK_ID}/log")]
+    assert log_calls[0]["json"] == {"message": "new message"}

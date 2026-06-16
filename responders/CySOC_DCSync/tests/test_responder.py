@@ -157,13 +157,16 @@ def test_check_treats_missing_whitelist_config_as_not_whitelisted(tmp_path):
 
 def test_update_requires_whitelist_config(tmp_path):
     write_job(tmp_path, "update", config_overrides={"consul_kv_whitelist": ""})
+    thehive = StubTheHive(OBSERVABLES)
 
     with pytest.raises(SystemExit):
-        run_responder(tmp_path, StubTheHive(OBSERVABLES), StubWhitelist())
+        run_responder(tmp_path, thehive, StubWhitelist())
 
     output = read_output(tmp_path)
     assert output["success"] is False
     assert "Consul KV whitelist key is missing" in output["errorMessage"]
+    assert "FAILED" in thehive.logs[0][3]
+    assert "Consul KV whitelist key is missing" in thehive.logs[0][3]
 
 
 def test_check_fails_safe_on_observable_without_enrichment(tmp_path):
@@ -179,6 +182,37 @@ def test_check_fails_safe_on_observable_without_enrichment(tmp_path):
     assert output["success"] is False
     assert "unresolved" in output["errorMessage"]
     assert thehive.closed == []
+    assert "FAILED" in thehive.logs[0][3]
+    assert "unresolved" in thehive.logs[0][3]
+
+
+def test_no_case_id_fails_without_logging(tmp_path):
+    write_job(tmp_path, "check", case={"caseId": 1, "title": "no id"})
+    thehive = StubTheHive(OBSERVABLES)
+
+    with pytest.raises(SystemExit):
+        run_responder(tmp_path, thehive, StubWhitelist())
+
+    assert read_output(tmp_path)["success"] is False
+    assert thehive.logs == []  # no case id known yet — nothing to log against
+
+
+def test_unexpected_error_is_logged_to_task(tmp_path):
+    write_job(tmp_path, "check")
+
+    class BrokenTheHive(StubTheHive):
+        def get_case_observables(self, case_id):
+            raise RuntimeError("boom")
+
+    thehive = BrokenTheHive(OBSERVABLES)
+
+    with pytest.raises(SystemExit):
+        run_responder(tmp_path, thehive, StubWhitelist())
+
+    output = read_output(tmp_path)
+    assert output["success"] is False
+    assert "FAILED" in thehive.logs[0][3]
+    assert "boom" in thehive.logs[0][3]
 
 
 def test_check_fails_safe_when_no_pair_found(tmp_path):
