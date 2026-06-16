@@ -109,7 +109,6 @@ def test_check_all_pairs_whitelisted_closes_case_as_fp(tmp_path):
     assert output["full"]["verdict"] == "false-positive"
     assert output["full"]["case_closed"] is True
     assert thehive.closed[0][0] == "~4128"
-    assert {"type": "AddTagToCase", "tag": "dcsync:false-positive"} in output["operations"]
 
 
 def test_check_fp_without_closing_when_disabled(tmp_path):
@@ -130,7 +129,6 @@ def test_check_unknown_pair_is_true_positive(tmp_path):
     assert output["full"]["verdict"] == "true-positive"
     assert output["full"]["unmatched"][0]["key"] == PAIR_KEY
     assert thehive.closed == []
-    assert {"type": "AddTagToCase", "tag": "dcsync:true-positive"} in output["operations"]
 
 
 def test_check_treats_missing_whitelist_config_as_not_whitelisted(tmp_path):
@@ -194,7 +192,6 @@ def test_update_adds_pair_with_metadata(tmp_path):
     assert metadata["hostname"] == "ws01.socdev.lan"
     assert metadata["added_by"] == "analyst@socdev.lan"
     assert metadata["case_number"] == 42
-    assert {"type": "AddTagToCase", "tag": "dcsync:whitelisted"} in output["operations"]
 
 
 def test_update_is_idempotent(tmp_path):

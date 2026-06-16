@@ -21,10 +21,6 @@ from cortexutils.responder import Responder
 from thehive_client import TheHiveClient, TheHiveError
 from whitelist import ConsulKVError, ConsulWhitelist, PairResolver
 
-TAG_FALSE_POSITIVE = "dcsync:false-positive"
-TAG_TRUE_POSITIVE = "dcsync:true-positive"
-TAG_WHITELISTED = "dcsync:whitelisted"
-
 
 class DCSyncWhitelistResponder(Responder):
     def __init__(self, job_directory=None):
@@ -149,14 +145,6 @@ class DCSyncWhitelistResponder(Responder):
                 "already_present": refreshed,
             }
         )
-
-    def operations(self, raw):
-        if raw.get("service") == "check":
-            tag = TAG_FALSE_POSITIVE if raw.get("verdict") == "false-positive" else TAG_TRUE_POSITIVE
-            return [self.build_operation("AddTagToCase", tag=tag)]
-        if raw.get("service") == "update":
-            return [self.build_operation("AddTagToCase", tag=TAG_WHITELISTED)]
-        return []
 
 
 if __name__ == "__main__":
