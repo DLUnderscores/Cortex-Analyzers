@@ -2,20 +2,26 @@
 # encoding: utf-8
 """Whitelist storage (Consul KV) and canonical user+host pair resolution.
 
-A whitelist entry is one Consul KV key under a per-tenant prefix:
+The whole whitelist lives in a single Consul KV key, as a YAML document
+mapping pair key -> metadata:
 
-    <prefix>/<account_object_id>:<device_id>
+    <account_object_id>:<device_id>:
+      account: ...
+      hostname: ...
+      ...
 
-The key alone decides a match; the JSON value only carries human-readable
+The pair key alone decides a match; the rest only carries human-readable
 metadata (who whitelisted what and why). Using directory object ids and MDE
 device ids makes every spelling of the same user/host (SAM name, UPN, mail,
-short hostname, FQDN, IP) map to the same entry.
+short hostname, FQDN, IP) map to the same entry. Writes are merged into the
+document with Consul check-and-set (cas=<ModifyIndex>) and retried on
+conflict, since the document is now a single resource shared by every write.
 """
 import base64
-import json
 from typing import Optional
 
 import requests
+import yaml
 
 HOST_DATA_TYPES = ("hostname",)
 USER_DATA_TYPES = ("username",)
@@ -43,48 +49,50 @@ def pair_key(user_id: str, device_id: str) -> str:
 
 
 class ConsulWhitelist:
-    def __init__(self, url: str, prefix: str, token: Optional[str] = None, http=requests):
+    MAX_CAS_ATTEMPTS = 5
+
+    def __init__(self, url: str, key: str, token: Optional[str] = None, http=requests):
         self.url = url.rstrip("/")
-        self.prefix = prefix.strip("/")
+        self.key = key.strip("/")
         self.http = http
         self.headers = {"X-Consul-Token": token} if token else {}
 
+    def _read(self) -> tuple:
+        """Return (entries, modify_index); modify_index is None when the key doesn't exist yet."""
+        resp = self.http.get(f"{self.url}/v1/kv/{self.key}", headers=self.headers, timeout=30)
+        if resp.status_code == 404:
+            return {}, None
+        if not (200 <= resp.status_code < 300):
+            raise ConsulKVError(f"Failed to read whitelist at {self.key}: HTTP {resp.status_code} — {resp.text}")
+        item = (resp.json() or [{}])[0]
+        value = item.get("Value")
+        entries = yaml.safe_load(base64.b64decode(value)) if value else None
+        return entries or {}, item.get("ModifyIndex")
+
     def entries(self) -> dict:
         """Return all whitelist entries as {pair_key: metadata}."""
-        resp = self.http.get(
-            f"{self.url}/v1/kv/{self.prefix}",
-            params={"recurse": "true"},
-            headers=self.headers,
-            timeout=30,
-        )
-        if resp.status_code == 404:
-            return {}
-        if not (200 <= resp.status_code < 300):
-            raise ConsulKVError(f"Failed to read whitelist at {self.prefix}: HTTP {resp.status_code} — {resp.text}")
-        entries = {}
-        for item in resp.json() or []:
-            key = item.get("Key", "")[len(self.prefix) :].strip("/")
-            if not key:
-                continue
-            value = item.get("Value")
-            metadata = {}
-            if value:
-                try:
-                    metadata = json.loads(base64.b64decode(value))
-                except (ValueError, TypeError):
-                    metadata = {"raw": base64.b64decode(value).decode("utf-8", errors="replace")}
-            entries[key] = metadata
-        return entries
+        return self._read()[0]
+
+    def _cas_update(self, mutate) -> None:
+        for _ in range(self.MAX_CAS_ATTEMPTS):
+            entries, index = self._read()
+            mutate(entries)
+            body = yaml.safe_dump(entries, default_flow_style=False, sort_keys=True, indent=2)
+            resp = self.http.put(
+                f"{self.url}/v1/kv/{self.key}",
+                params={"cas": index or 0},
+                data=body.encode("utf-8"),
+                headers=self.headers,
+                timeout=30,
+            )
+            if not (200 <= resp.status_code < 300):
+                raise ConsulKVError(f"Failed to write whitelist at {self.key}: HTTP {resp.status_code} — {resp.text}")
+            if resp.json() is True:
+                return
+        raise ConsulKVError(f"Failed to write whitelist at {self.key} after {self.MAX_CAS_ATTEMPTS} attempts — concurrent update")
 
     def put(self, key: str, metadata: dict) -> None:
-        resp = self.http.put(
-            f"{self.url}/v1/kv/{self.prefix}/{key}",
-            data=json.dumps(metadata, ensure_ascii=False).encode("utf-8"),
-            headers=self.headers,
-            timeout=30,
-        )
-        if not (200 <= resp.status_code < 300):
-            raise ConsulKVError(f"Failed to write whitelist entry {key}: HTTP {resp.status_code} — {resp.text}")
+        self._cas_update(lambda entries: entries.__setitem__(key, metadata))
 
 
 def select_candidates(observables: list, data_types: tuple, ignore_tag_prefix: str = ARTIFACT_TAG_PREFIX) -> list:

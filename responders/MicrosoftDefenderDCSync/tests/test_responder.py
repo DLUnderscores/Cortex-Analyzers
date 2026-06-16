@@ -80,7 +80,7 @@ def write_job(tmp_path, service, case=CASE, config_overrides=None):
         "thehive_url": "http://thehive",
         "thehive_api_key": "key",
         "consul_url": "http://consul:8500",
-        "consul_kv_prefix": "cysoc/office/sirp/dcsync/whitelist",
+        "consul_kv_whitelist": "cysoc/office/sirp/dcsync/whitelist",
     }
     config.update(config_overrides or {})
     (tmp_path / "input").mkdir()
@@ -131,6 +131,28 @@ def test_check_unknown_pair_is_true_positive(tmp_path):
     assert output["full"]["unmatched"][0]["key"] == PAIR_KEY
     assert thehive.closed == []
     assert {"type": "AddTagToCase", "tag": "dcsync:true-positive"} in output["operations"]
+
+
+def test_check_treats_missing_whitelist_config_as_not_whitelisted(tmp_path):
+    write_job(tmp_path, "check", config_overrides={"consul_kv_whitelist": ""})
+    thehive = StubTheHive(OBSERVABLES)
+    # stub has the pair whitelisted, but it must never be consulted without a configured key
+    output = run_responder(tmp_path, thehive, StubWhitelist({PAIR_KEY: {"account": "svc-sync"}}))
+
+    assert output["full"]["verdict"] == "true-positive"
+    assert output["full"]["whitelist_configured"] is False
+    assert thehive.closed == []
+
+
+def test_update_requires_whitelist_config(tmp_path):
+    write_job(tmp_path, "update", config_overrides={"consul_kv_whitelist": ""})
+
+    with pytest.raises(SystemExit):
+        run_responder(tmp_path, StubTheHive(OBSERVABLES), StubWhitelist())
+
+    output = read_output(tmp_path)
+    assert output["success"] is False
+    assert "Consul KV whitelist key is missing" in output["errorMessage"]
 
 
 def test_check_fails_safe_on_observable_without_enrichment(tmp_path):

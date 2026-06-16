@@ -39,11 +39,11 @@
             "defaultValue": "http://consul.service.consul:8500"
         },
         {
-            "name": "consul_kv_prefix",
-            "description": "Consul KV prefix holding the whitelist entries",
+            "name": "consul_kv_whitelist",
+            "description": "Exact Consul KV path to the whitelist key (a single key holding a YAML document, not a directory prefix). Leave empty to skip the whitelist check — every pair is then treated as not whitelisted (true positive, case stays open)",
             "type": "string",
             "multi": false,
-            "required": true,
+            "required": false,
             "defaultValue": ""
         },
         {

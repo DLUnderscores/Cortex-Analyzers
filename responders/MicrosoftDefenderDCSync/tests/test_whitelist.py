@@ -1,7 +1,7 @@
 import base64
-import json
 
 import pytest
+import yaml
 from conftest import FakeResponse
 
 from whitelist import (
@@ -138,37 +138,78 @@ def test_resolve_only_destination_tagged_yields_no_pairs():
     assert selection == "source-role-tags"
 
 
-def consul_item(prefix, key, metadata):
-    return {"Key": f"{prefix}/{key}", "Value": base64.b64encode(json.dumps(metadata).encode()).decode()}
+def consul_item(key, entries, modify_index=1):
+    body = yaml.safe_dump(entries, default_flow_style=False, sort_keys=True, indent=2)
+    return [{"Key": key, "Value": base64.b64encode(body.encode()).decode(), "ModifyIndex": modify_index}]
 
 
 def test_consul_whitelist_entries(fake_http):
-    prefix = "cysoc/office/sirp/dcsync/whitelist"
-    key = pair_key(USER_GUID, DEVICE_ID)
-    fake_http.route("GET", f"/v1/kv/{prefix}", FakeResponse(200, [consul_item(prefix, key, {"account": "svc-sync"})]))
-    wl = ConsulWhitelist("http://consul:8500", prefix, http=fake_http)
-    assert wl.entries() == {key: {"account": "svc-sync"}}
+    key = "cysoc/office/sirp/dcsync/whitelist"
+    pkey = pair_key(USER_GUID, DEVICE_ID)
+    fake_http.route("GET", f"/v1/kv/{key}", FakeResponse(200, consul_item(key, {pkey: {"account": "svc-sync"}})))
+    wl = ConsulWhitelist("http://consul:8500", key, http=fake_http)
+    assert wl.entries() == {pkey: {"account": "svc-sync"}}
 
 
 def test_consul_whitelist_empty_on_404(fake_http):
     fake_http.route("GET", "/v1/kv/", FakeResponse(404))
-    wl = ConsulWhitelist("http://consul:8500", "some/prefix", http=fake_http)
+    wl = ConsulWhitelist("http://consul:8500", "some/key", http=fake_http)
     assert wl.entries() == {}
 
 
 def test_consul_whitelist_put_and_token_header(fake_http):
-    prefix = "cysoc/office/sirp/dcsync/whitelist"
-    key = pair_key(USER_GUID, DEVICE_ID)
-    fake_http.route("PUT", f"/v1/kv/{prefix}/{key}", FakeResponse(200, True))
-    wl = ConsulWhitelist("http://consul:8500/", prefix, token="s3cret", http=fake_http)
-    wl.put(key, {"account": "svc-sync"})
+    key = "cysoc/office/sirp/dcsync/whitelist"
+    pkey = pair_key(USER_GUID, DEVICE_ID)
+    fake_http.route("GET", f"/v1/kv/{key}", FakeResponse(200, consul_item(key, {}, modify_index=5)))
+    fake_http.route("PUT", f"/v1/kv/{key}", FakeResponse(200, True))
+    wl = ConsulWhitelist("http://consul:8500/", key, token="s3cret", http=fake_http)
+    wl.put(pkey, {"account": "svc-sync"})
     call = fake_http.calls[-1]
     assert call["headers"] == {"X-Consul-Token": "s3cret"}
-    assert json.loads(call["data"]) == {"account": "svc-sync"}
+    assert call["params"] == {"cas": 5}
+    assert yaml.safe_load(call["data"]) == {pkey: {"account": "svc-sync"}}
+
+
+def test_consul_whitelist_put_creates_when_absent(fake_http):
+    key = "cysoc/office/sirp/dcsync/whitelist"
+    pkey = pair_key(USER_GUID, DEVICE_ID)
+    fake_http.route("GET", f"/v1/kv/{key}", FakeResponse(404))
+    fake_http.route("PUT", f"/v1/kv/{key}", FakeResponse(200, True))
+    wl = ConsulWhitelist("http://consul:8500", key, http=fake_http)
+    wl.put(pkey, {"account": "svc-sync"})
+    call = fake_http.calls[-1]
+    assert call["params"] == {"cas": 0}
+    assert yaml.safe_load(call["data"]) == {pkey: {"account": "svc-sync"}}
+
+
+def test_consul_whitelist_put_retries_on_cas_conflict(fake_http):
+    key = "cysoc/office/sirp/dcsync/whitelist"
+    pkey = pair_key(USER_GUID, DEVICE_ID)
+    fake_http.route("GET", f"/v1/kv/{key}", FakeResponse(200, consul_item(key, {}, modify_index=5)))
+    put_attempts = {"count": 0}
+
+    def put_response(**kwargs):
+        put_attempts["count"] += 1
+        return FakeResponse(200, put_attempts["count"] > 1)
+
+    fake_http.route("PUT", f"/v1/kv/{key}", put_response)
+    wl = ConsulWhitelist("http://consul:8500", key, http=fake_http)
+    wl.put(pkey, {"account": "svc-sync"})
+    assert put_attempts["count"] == 2
+
+
+def test_consul_whitelist_put_raises_after_max_cas_attempts(fake_http):
+    key = "cysoc/office/sirp/dcsync/whitelist"
+    pkey = pair_key(USER_GUID, DEVICE_ID)
+    fake_http.route("GET", f"/v1/kv/{key}", FakeResponse(200, consul_item(key, {}, modify_index=5)))
+    fake_http.route("PUT", f"/v1/kv/{key}", FakeResponse(200, False))
+    wl = ConsulWhitelist("http://consul:8500", key, http=fake_http)
+    with pytest.raises(ConsulKVError):
+        wl.put(pkey, {"account": "svc-sync"})
 
 
 def test_consul_whitelist_raises_on_error(fake_http):
     fake_http.route("GET", "/v1/kv/", FakeResponse(500, text="boom"))
-    wl = ConsulWhitelist("http://consul:8500", "some/prefix", http=fake_http)
+    wl = ConsulWhitelist("http://consul:8500", "some/key", http=fake_http)
     with pytest.raises(ConsulKVError):
         wl.entries()

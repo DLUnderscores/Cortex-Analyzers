@@ -33,7 +33,9 @@ class DCSyncWhitelistResponder(Responder):
         self.thehive_url = self.get_param("config.thehive_url", None, "TheHive URL is missing")
         self.thehive_api_key = self.get_param("config.thehive_api_key", None, "TheHive API key is missing")
         self.consul_url = self.get_param("config.consul_url", "http://consul.service.consul:8500")
-        self.consul_kv_prefix = self.get_param("config.consul_kv_prefix", None, "Consul KV prefix is missing")
+        # Optional for "check" — an unconfigured whitelist fails safe to "not whitelisted"
+        # rather than blocking the job. Required for "update" (enforced in run()).
+        self.consul_kv_whitelist = self.get_param("config.consul_kv_whitelist", None)
         self.consul_token = self.get_param("config.consul_token", None)
         self.close_on_fp = self.get_param("config.close_on_fp", True)
 
@@ -42,7 +44,7 @@ class DCSyncWhitelistResponder(Responder):
         return TheHiveClient(self.thehive_url, self.thehive_api_key)
 
     def _whitelist(self):
-        return ConsulWhitelist(self.consul_url, self.consul_kv_prefix, token=self.consul_token)
+        return ConsulWhitelist(self.consul_url, self.consul_kv_whitelist, token=self.consul_token)
 
     def _resolver(self):
         return PairResolver()
@@ -68,11 +70,13 @@ class DCSyncWhitelistResponder(Responder):
                     f"Cannot evaluate case {case_id} — no user+host pair could be derived from the case observables"
                 )
 
-            whitelist = self._whitelist()
             if self.service == "check":
+                whitelist = self._whitelist() if self.consul_kv_whitelist else None
                 self.check(case, case_id, thehive, whitelist, pairs, pair_selection)
             elif self.service == "update":
-                self.update(case, case_id, whitelist, pairs, pair_selection)
+                if not self.consul_kv_whitelist:
+                    self.error("Consul KV whitelist key is missing")
+                self.update(case, case_id, self._whitelist(), pairs, pair_selection)
             else:
                 self.error(f"Unknown service: {self.service}")
         except (TheHiveError, ConsulKVError) as exc:
@@ -83,7 +87,7 @@ class DCSyncWhitelistResponder(Responder):
             self.unexpectedError(traceback.format_exc())
 
     def check(self, case, case_id, thehive, whitelist, pairs, pair_selection):
-        entries = whitelist.entries()
+        entries = whitelist.entries() if whitelist else {}
         matched, unmatched = [], []
         for pair in pairs:
             if pair["key"] in entries:
@@ -108,6 +112,7 @@ class DCSyncWhitelistResponder(Responder):
                 "service": "check",
                 "case_id": case_id,
                 "verdict": verdict,
+                "whitelist_configured": whitelist is not None,
                 "pair_selection": pair_selection,
                 "pairs_evaluated": len(pairs),
                 "matched": matched,
