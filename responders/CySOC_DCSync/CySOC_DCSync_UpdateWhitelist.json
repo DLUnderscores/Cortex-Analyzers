@@ -1,5 +1,5 @@
 {
-    "name": "DCSync_UpdateWhitelist",
+    "name": "CySOC_DCSync_UpdateWhitelist",
     "version": "1.0",
     "author": "CySOC",
     "url": "https://github.com/TheHive-Project/Cortex-Analyzers",
@@ -8,8 +8,8 @@
     "dataTypeList": [
         "thehive:case"
     ],
-    "command": "MicrosoftDefenderDCSync/dcsync_whitelist.py",
-    "baseConfig": "MicrosoftDefenderDCSync",
+    "command": "CySOC_DCSync/dcsync_whitelist.py",
+    "baseConfig": "CySOC_DCSync",
     "config": {
         "service": "update"
     },
