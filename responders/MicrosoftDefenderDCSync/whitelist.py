@@ -17,8 +17,8 @@ from typing import Optional
 
 import requests
 
-HOST_DATA_TYPES = ("hostname", "fqdn")
-USER_DATA_TYPES = ("username", "mail")
+HOST_DATA_TYPES = ("hostname",)
+USER_DATA_TYPES = ("username",)
 
 # Taxonomy predicates produced by the MicrosoftDefender enrichment analyzers
 DEVICE_ID_PREDICATES = ("Device_ID",)
