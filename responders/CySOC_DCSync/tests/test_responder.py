@@ -117,6 +117,7 @@ def test_check_all_pairs_whitelisted_closes_case_as_fp(tmp_path):
     assert output["full"]["case_closed"] is True
     assert thehive.closed[0] == ("~4128", "false-positive")
     assert thehive.logs[0][1:3] == ("CySOC", "Log")
+    assert thehive.logs[0][3].startswith("CySOC_DCSync_Respond:")
     assert "false-positive" in thehive.logs[0][3]
 
 
@@ -240,18 +241,25 @@ def test_update_adds_pair_with_metadata(tmp_path):
     assert metadata["hostname"] == "ws01.socdev.lan"
     assert metadata["added_by"] == "analyst@socdev.lan"
     assert metadata["case_number"] == 42
+    assert output["full"]["case_closed"] is True
+    assert thehive.closed[0] == ("~4128", "false-positive")
     assert thehive.logs[0][1:3] == ("CySOC", "Log")
+    assert thehive.logs[0][3].startswith("CySOC_DCSync_UpdateWhitelist:")
+    assert "case #" not in thehive.logs[0][3]
     assert "added to whitelist" in thehive.logs[0][3]
+    assert "case closed as false-positive" in thehive.logs[0][3]
 
 
 def test_update_is_idempotent(tmp_path):
     write_job(tmp_path, "update")
     whitelist = StubWhitelist({PAIR_KEY: {"account": "svc-sync"}})
-    output = run_responder(tmp_path, StubTheHive(OBSERVABLES), whitelist)
+    thehive = StubTheHive(OBSERVABLES)
+    output = run_responder(tmp_path, thehive, whitelist)
 
     assert output["full"]["added"] == []
     assert output["full"]["already_present"][0]["key"] == PAIR_KEY
     assert len(whitelist.writes) == 1  # metadata refreshed in place
+    assert thehive.closed[0] == ("~4128", "false-positive")
 
 
 def role_tagged_observables():

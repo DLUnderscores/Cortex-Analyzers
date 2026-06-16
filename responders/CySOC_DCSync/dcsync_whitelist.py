@@ -13,8 +13,9 @@ check:  Evaluate every (user, host) pair derived from the case observables
         true positive, since "couldn't check" isn't the same as "checked and
         it's bad".
 
-update: Write every (user, host) pair of the case to the whitelist. Run by
-        the analyst after a true positive is rejected at check level 2.
+update: Write every (user, host) pair of the case to the whitelist and close
+        the case as a false positive. Run by the analyst after a true
+        positive is rejected at check level 2.
 
 Both services append a one-line summary of the decision to a TheHive task
 (group "CySOC", title "Log"), creating it on the case if it doesn't exist
@@ -31,6 +32,9 @@ from whitelist import ConsulKVError, ConsulWhitelist, PairResolver
 
 LOG_TASK_GROUP = "CySOC"
 LOG_TASK_TITLE = "Log"
+
+# Log-line prefixes, named after the responder definitions analysts see in TheHive.
+LOG_PREFIX = {"check": "CySOC_DCSync_Respond", "update": "CySOC_DCSync_UpdateWhitelist"}
 
 
 class DCSyncWhitelistResponder(Responder):
@@ -66,7 +70,8 @@ class DCSyncWhitelistResponder(Responder):
     def _log_failure(self, thehive, case_id, message):
         """Best-effort: only possible once a case/TheHive client is known, so it's a no-op before that."""
         if case_id and thehive:
-            self._log(thehive, case_id, f"DCSync {self.service}: FAILED — {message}")
+            prefix = LOG_PREFIX.get(self.service, self.service)
+            self._log(thehive, case_id, f"{prefix}: FAILED — {message}")
 
     def _fail(self, thehive, case_id, message):
         self._log_failure(thehive, case_id, message)
@@ -127,14 +132,14 @@ class DCSyncWhitelistResponder(Responder):
         if whitelist is None:
             verdict = "true-positive"
             log_message = (
-                "DCSync check: whitelist not configured — cannot confirm status, case left open for "
-                "manual review. Pair(s) evaluated: " + ", ".join(f"{p['user']}@{p['host']}" for p in pairs)
+                f"{LOG_PREFIX['check']}: whitelist not configured — cannot confirm status, case left open "
+                "for manual review. Pair(s) evaluated: " + ", ".join(f"{p['user']}@{p['host']}" for p in pairs)
             )
         elif unmatched:
             verdict = "true-positive"
             log_message = (
-                "DCSync check: closed automatically as a true-positive — user+host pair(s) not found in "
-                "the whitelist: " + ", ".join(f"{p['user']}@{p['host']}" for p in unmatched)
+                f"{LOG_PREFIX['check']}: closed automatically as a true-positive — user+host pair(s) not "
+                "found in the whitelist: " + ", ".join(f"{p['user']}@{p['host']}" for p in unmatched)
             )
             thehive.close_case_true_positive(case_id)
             case_closed = True
@@ -142,11 +147,11 @@ class DCSyncWhitelistResponder(Responder):
             verdict = "false-positive"
             whitelisted = ", ".join(f"{p['user']}@{p['host']}" for p in matched)
             if self.close_on_fp:
-                log_message = f"DCSync check: closed automatically as a false-positive — whitelisted user+host pair(s): {whitelisted}"
+                log_message = f"{LOG_PREFIX['check']}: closed automatically as a false-positive — whitelisted user+host pair(s): {whitelisted}"
                 thehive.close_case_false_positive(case_id)
                 case_closed = True
             else:
-                log_message = f"DCSync check: verdict false-positive (not auto-closed — close_on_fp disabled) — whitelisted user+host pair(s): {whitelisted}"
+                log_message = f"{LOG_PREFIX['check']}: verdict false-positive (not auto-closed — close_on_fp disabled) — whitelisted user+host pair(s): {whitelisted}"
 
         self._log(thehive, case_id, log_message)
 
@@ -183,7 +188,8 @@ class DCSyncWhitelistResponder(Responder):
             whitelist.put(pair["key"], metadata)
             (refreshed if pair["key"] in entries else added).append({**pair, "entry": metadata})
 
-        case_number = case.get("caseId") or case.get("number")
+        thehive.close_case_false_positive(case_id)
+
         parts = []
         if added:
             parts.append("added to whitelist: " + ", ".join(f"{p['user']}@{p['host']}" for p in added))
@@ -191,7 +197,8 @@ class DCSyncWhitelistResponder(Responder):
             parts.append(
                 "already on whitelist (metadata refreshed): " + ", ".join(f"{p['user']}@{p['host']}" for p in refreshed)
             )
-        self._log(thehive, case_id, f"DCSync update (case #{case_number}): " + "; ".join(parts))
+        parts.append("case closed as false-positive")
+        self._log(thehive, case_id, f"{LOG_PREFIX['update']}: " + "; ".join(parts))
 
         self.report(
             {
@@ -200,6 +207,7 @@ class DCSyncWhitelistResponder(Responder):
                 "pair_selection": pair_selection,
                 "added": added,
                 "already_present": refreshed,
+                "case_closed": True,
             }
         )
 
