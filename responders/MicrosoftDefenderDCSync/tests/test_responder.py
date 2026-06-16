@@ -39,13 +39,20 @@ OBSERVABLES = [
 class StubTheHive:
     def __init__(self, observables):
         self.observables = observables
-        self.closed = []
+        self.closed = []  # (case_id, verdict)
+        self.logs = []  # (case_id, group, title, message)
 
     def get_case_observables(self, case_id):
         return self.observables
 
-    def close_case_false_positive(self, case_id, summary):
-        self.closed.append((case_id, summary))
+    def close_case_false_positive(self, case_id):
+        self.closed.append((case_id, "false-positive"))
+
+    def close_case_true_positive(self, case_id):
+        self.closed.append((case_id, "true-positive"))
+
+    def log_to_task(self, case_id, group, title, message):
+        self.logs.append((case_id, group, title, message))
 
 
 class StubWhitelist:
@@ -108,7 +115,9 @@ def test_check_all_pairs_whitelisted_closes_case_as_fp(tmp_path):
     assert output["success"] is True
     assert output["full"]["verdict"] == "false-positive"
     assert output["full"]["case_closed"] is True
-    assert thehive.closed[0][0] == "~4128"
+    assert thehive.closed[0] == ("~4128", "false-positive")
+    assert thehive.logs[0][1:3] == ("CySOC", "Log")
+    assert "false-positive" in thehive.logs[0][3]
 
 
 def test_check_fp_without_closing_when_disabled(tmp_path):
@@ -128,7 +137,9 @@ def test_check_unknown_pair_is_true_positive(tmp_path):
 
     assert output["full"]["verdict"] == "true-positive"
     assert output["full"]["unmatched"][0]["key"] == PAIR_KEY
-    assert thehive.closed == []
+    assert output["full"]["case_closed"] is True
+    assert thehive.closed[0] == ("~4128", "true-positive")
+    assert "not found in the whitelist" in thehive.logs[0][3]
 
 
 def test_check_treats_missing_whitelist_config_as_not_whitelisted(tmp_path):
@@ -139,7 +150,9 @@ def test_check_treats_missing_whitelist_config_as_not_whitelisted(tmp_path):
 
     assert output["full"]["verdict"] == "true-positive"
     assert output["full"]["whitelist_configured"] is False
+    assert output["full"]["case_closed"] is False
     assert thehive.closed == []
+    assert "not configured" in thehive.logs[0][3]
 
 
 def test_update_requires_whitelist_config(tmp_path):
@@ -182,7 +195,8 @@ def test_check_fails_safe_when_no_pair_found(tmp_path):
 def test_update_adds_pair_with_metadata(tmp_path):
     write_job(tmp_path, "update")
     whitelist = StubWhitelist()
-    output = run_responder(tmp_path, StubTheHive(OBSERVABLES), whitelist)
+    thehive = StubTheHive(OBSERVABLES)
+    output = run_responder(tmp_path, thehive, whitelist)
 
     assert output["full"]["added"][0]["key"] == PAIR_KEY
     assert output["full"]["already_present"] == []
@@ -192,6 +206,8 @@ def test_update_adds_pair_with_metadata(tmp_path):
     assert metadata["hostname"] == "ws01.socdev.lan"
     assert metadata["added_by"] == "analyst@socdev.lan"
     assert metadata["case_number"] == 42
+    assert thehive.logs[0][1:3] == ("CySOC", "Log")
+    assert "added to whitelist" in thehive.logs[0][3]
 
 
 def test_update_is_idempotent(tmp_path):

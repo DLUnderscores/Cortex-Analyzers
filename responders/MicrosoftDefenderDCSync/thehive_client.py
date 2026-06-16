@@ -40,12 +40,13 @@ class TheHiveClient:
             raise TheHiveError(f"Failed to fetch observables for case {case_id}: HTTP {resp.status_code} — {resp.text}")
         return resp.json() or []
 
-    def close_case_false_positive(self, case_id: str, summary: str) -> None:
+    def close_case_false_positive(self, case_id: str) -> None:
+        # No "summary" field here — the case Summary is analyst-owned; the decision is logged
+        # to the Log task instead (see DCSyncWhitelistResponder._log).
         body = {
             "status": "Resolved",
             "resolutionStatus": "FalsePositive",
             "impactStatus": "NotApplicable",
-            "summary": summary,
         }
         resp = self.http.patch(
             f"{self.url}/api/case/{case_id}",
@@ -56,3 +57,93 @@ class TheHiveClient:
         )
         if not (200 <= resp.status_code < 300):
             raise TheHiveError(f"Failed to close case {case_id}: HTTP {resp.status_code} — {resp.text}")
+
+    def close_case_true_positive(self, case_id: str) -> None:
+        body = {
+            "status": "Resolved",
+            "resolutionStatus": "TruePositive",
+            "impactStatus": "WithImpact",
+        }
+        resp = self.http.patch(
+            f"{self.url}/api/case/{case_id}",
+            headers=self.headers,
+            json=body,
+            verify=self.verify,
+            timeout=30,
+        )
+        if not (200 <= resp.status_code < 300):
+            raise TheHiveError(f"Failed to close case {case_id}: HTTP {resp.status_code} — {resp.text}")
+
+    def get_case_tasks(self, case_id: str) -> list:
+        """Return all tasks of a case."""
+        body = {
+            "query": [
+                {"_name": "getCase", "idOrName": case_id},
+                {"_name": "tasks"},
+                {"_name": "page", "from": 0, "to": 1000},
+            ]
+        }
+        resp = self.http.post(
+            f"{self.url}/api/v1/query",
+            params={"name": "case-tasks"},
+            headers=self.headers,
+            json=body,
+            verify=self.verify,
+            timeout=30,
+        )
+        if not (200 <= resp.status_code < 300):
+            raise TheHiveError(f"Failed to fetch tasks for case {case_id}: HTTP {resp.status_code} — {resp.text}")
+        return resp.json() or []
+
+    def _complete_task(self, task_id: str) -> None:
+        """Drive a task to "Completed" — it's a log, not a checklist item, so it's never left open."""
+        for status in ("InProgress", "Completed"):
+            self.http.patch(
+                f"{self.url}/api/case/task/{task_id}",
+                headers=self.headers,
+                json={"status": status},
+                verify=self.verify,
+                timeout=30,
+            )
+
+    def create_task(self, case_id: str, title: str, group: str) -> str:
+        resp = self.http.post(
+            f"{self.url}/api/case/{case_id}/task",
+            headers=self.headers,
+            json={"title": title, "group": group},
+            verify=self.verify,
+            timeout=30,
+        )
+        if not (200 <= resp.status_code < 300):
+            raise TheHiveError(
+                f"Failed to create task '{title}' for case {case_id}: HTTP {resp.status_code} — {resp.text}"
+            )
+        task = resp.json()
+        task_id = task.get("_id") or task.get("id")
+        self._complete_task(task_id)
+        return task_id
+
+    def get_or_create_task(self, case_id: str, group: str, title: str) -> str:
+        for task in self.get_case_tasks(case_id):
+            if task.get("group") == group and task.get("title") == title:
+                task_id = task.get("_id") or task.get("id")
+                if task.get("status") != "Completed":
+                    self._complete_task(task_id)
+                return task_id
+        return self.create_task(case_id, title, group)
+
+    def add_task_log(self, task_id: str, message: str) -> None:
+        resp = self.http.post(
+            f"{self.url}/api/case/task/{task_id}/log",
+            headers=self.headers,
+            json={"message": message},
+            verify=self.verify,
+            timeout=30,
+        )
+        if not (200 <= resp.status_code < 300):
+            raise TheHiveError(f"Failed to write log to task {task_id}: HTTP {resp.status_code} — {resp.text}")
+
+    def log_to_task(self, case_id: str, group: str, title: str, message: str) -> None:
+        """Find-or-create the (group, title) task on the case and append a log entry to it."""
+        task_id = self.get_or_create_task(case_id, group, title)
+        self.add_task_log(task_id, message)

@@ -3,15 +3,23 @@
 """DCSync whitelist responders (TheHive case level).
 
 check:  Evaluate every (user, host) pair derived from the case observables
-        against the Consul KV whitelist. All pairs whitelisted → false
-        positive (optionally closes the case); any pair unknown → true
-        positive. Canonical ids come exclusively from the MicrosoftDefender
-        enrichment reports attached to the observables; an observable
-        without enrichment fails the job (fail-safe: the case is never
-        closed on incomplete information).
+        against the Consul KV whitelist. All pairs whitelisted → closes the
+        case as a false positive (optional); any pair unknown → closes the
+        case as a true positive. Canonical ids come exclusively from the
+        MicrosoftDefender enrichment reports attached to the observables; an
+        observable without enrichment fails the job (fail-safe: the case is
+        never closed on incomplete information). If the whitelist itself
+        isn't configured, the case is left open instead of being closed as a
+        true positive, since "couldn't check" isn't the same as "checked and
+        it's bad".
 
 update: Write every (user, host) pair of the case to the whitelist. Run by
         the analyst after a true positive is rejected at check level 2.
+
+Both services append a one-line summary of the decision to a TheHive task
+(group "CySOC", title "Log"), creating it on the case if it doesn't exist
+yet, so analysts can see why a case was auto-closed without digging through
+the responder job output.
 """
 import traceback
 from datetime import datetime, timezone
@@ -20,6 +28,9 @@ from cortexutils.responder import Responder
 
 from thehive_client import TheHiveClient, TheHiveError
 from whitelist import ConsulKVError, ConsulWhitelist, PairResolver
+
+LOG_TASK_GROUP = "CySOC"
+LOG_TASK_TITLE = "Log"
 
 
 class DCSyncWhitelistResponder(Responder):
@@ -44,6 +55,13 @@ class DCSyncWhitelistResponder(Responder):
 
     def _resolver(self):
         return PairResolver()
+
+    def _log(self, thehive, case_id, message):
+        """Best-effort: a logging hiccup must never fail the job whose result it's recording."""
+        try:
+            thehive.log_to_task(case_id, LOG_TASK_GROUP, LOG_TASK_TITLE, message)
+        except TheHiveError:
+            pass
 
     def run(self):
         try:
@@ -72,7 +90,7 @@ class DCSyncWhitelistResponder(Responder):
             elif self.service == "update":
                 if not self.consul_kv_whitelist:
                     self.error("Consul KV whitelist key is missing")
-                self.update(case, case_id, self._whitelist(), pairs, pair_selection)
+                self.update(case, case_id, thehive, self._whitelist(), pairs, pair_selection)
             else:
                 self.error(f"Unknown service: {self.service}")
         except (TheHiveError, ConsulKVError) as exc:
@@ -92,16 +110,31 @@ class DCSyncWhitelistResponder(Responder):
                 unmatched.append(pair)
 
         case_closed = False
-        if unmatched:
+        if whitelist is None:
             verdict = "true-positive"
+            log_message = (
+                "DCSync check: whitelist not configured — cannot confirm status, case left open for "
+                "manual review. Pair(s) evaluated: " + ", ".join(f"{p['user']}@{p['host']}" for p in pairs)
+            )
+        elif unmatched:
+            verdict = "true-positive"
+            log_message = (
+                "DCSync check: closed automatically as a true-positive — user+host pair(s) not found in "
+                "the whitelist: " + ", ".join(f"{p['user']}@{p['host']}" for p in unmatched)
+            )
+            thehive.close_case_true_positive(case_id)
+            case_closed = True
         else:
             verdict = "false-positive"
+            whitelisted = ", ".join(f"{p['user']}@{p['host']}" for p in matched)
             if self.close_on_fp:
-                summary = "Closed automatically as a false-positive — whitelisted user+host pair(s): " + ", ".join(
-                    f"{p['user']}@{p['host']}" for p in matched
-                )
-                thehive.close_case_false_positive(case_id, summary)
+                log_message = f"DCSync check: closed automatically as a false-positive — whitelisted user+host pair(s): {whitelisted}"
+                thehive.close_case_false_positive(case_id)
                 case_closed = True
+            else:
+                log_message = f"DCSync check: verdict false-positive (not auto-closed — close_on_fp disabled) — whitelisted user+host pair(s): {whitelisted}"
+
+        self._log(thehive, case_id, log_message)
 
         self.report(
             {
@@ -117,7 +150,7 @@ class DCSyncWhitelistResponder(Responder):
             }
         )
 
-    def update(self, case, case_id, whitelist, pairs, pair_selection):
+    def update(self, case, case_id, thehive, whitelist, pairs, pair_selection):
         entries = whitelist.entries()
         added, refreshed = [], []
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -135,6 +168,16 @@ class DCSyncWhitelistResponder(Responder):
             }
             whitelist.put(pair["key"], metadata)
             (refreshed if pair["key"] in entries else added).append({**pair, "entry": metadata})
+
+        case_number = case.get("caseId") or case.get("number")
+        parts = []
+        if added:
+            parts.append("added to whitelist: " + ", ".join(f"{p['user']}@{p['host']}" for p in added))
+        if refreshed:
+            parts.append(
+                "already on whitelist (metadata refreshed): " + ", ".join(f"{p['user']}@{p['host']}" for p in refreshed)
+            )
+        self._log(thehive, case_id, f"DCSync update (case #{case_number}): " + "; ".join(parts))
 
         self.report(
             {

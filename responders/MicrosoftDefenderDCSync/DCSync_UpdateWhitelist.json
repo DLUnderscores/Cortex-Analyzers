@@ -4,7 +4,7 @@
     "author": "CySOC",
     "url": "https://github.com/TheHive-Project/Cortex-Analyzers",
     "license": "AGPL-V3",
-    "description": "Add the user+host pair(s) of a DCSync case to the whitelist stored in Consul KV. Stable identifiers (Microsoft Defender device id, directory object id) are read from the MicrosoftDefender enrichment analyzer reports attached to the observables, so different spellings of the same user/host never create duplicate entries. Fails when an observable lacks enrichment. Run by the analyst when a true positive is rejected at the final verification step.",
+    "description": "Add the user+host pair(s) of a DCSync case to the whitelist stored in Consul KV. Stable identifiers (Microsoft Defender device id, directory object id) are read from the MicrosoftDefender enrichment analyzer reports attached to the observables, so different spellings of the same user/host never create duplicate entries. Fails when an observable lacks enrichment. Run by the analyst when a true positive is rejected at the final verification step. The added/refreshed pairs are logged to a 'CySOC/Log' task on the case.",
     "dataTypeList": [
         "thehive:case"
     ],

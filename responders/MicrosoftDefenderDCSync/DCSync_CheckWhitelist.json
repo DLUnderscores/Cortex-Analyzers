@@ -4,7 +4,7 @@
     "author": "CySOC",
     "url": "https://github.com/TheHive-Project/Cortex-Analyzers",
     "license": "AGPL-V3",
-    "description": "Evaluate a DCSync case against the user+host whitelist stored in Consul KV. Stable identifiers (Microsoft Defender device id, directory object id) are read from the MicrosoftDefender enrichment analyzer reports attached to the observables, so any spelling of the same user/host matches the same whitelist entry. All pairs whitelisted: closes the case as a false positive; otherwise leaves it open as a true positive. Fails without closing when an observable lacks enrichment.",
+    "description": "Evaluate a DCSync case against the user+host whitelist stored in Consul KV. Stable identifiers (Microsoft Defender device id, directory object id) are read from the MicrosoftDefender enrichment analyzer reports attached to the observables, so any spelling of the same user/host matches the same whitelist entry. All pairs whitelisted: closes the case as a false positive. Any pair not whitelisted: closes the case as a true positive. Fails without closing when an observable lacks enrichment. The decision is always logged to a 'CySOC/Log' task on the case.",
     "dataTypeList": [
         "thehive:case"
     ],
