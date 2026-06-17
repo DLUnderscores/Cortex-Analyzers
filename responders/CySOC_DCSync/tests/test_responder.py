@@ -55,7 +55,7 @@ class StubTheHive:
     def close_case_true_positive(self, case_id):
         self.closed.append((case_id, "true-positive"))
 
-    def log_to_task(self, case_id, group, title, message):
+    def log_to_task(self, case_id, group, title, message, dedup=True):
         self.logs.append((case_id, group, title, message))
 
 

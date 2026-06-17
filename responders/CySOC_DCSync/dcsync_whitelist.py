@@ -86,9 +86,16 @@ class DCSyncWhitelistResponder(Responder):
         return PairResolver()
 
     def _log(self, thehive, case_id, message):
-        """Best-effort: a logging hiccup must never fail the job whose result it's recording."""
+        """Best-effort: a logging hiccup must never fail the job whose result it's recording.
+
+        Only the first call per run performs a dedup check against TheHive's last task log — this
+        prevents repeating an identical run-level verdict from a previous execution. All subsequent
+        calls within the same run bypass dedup so per-action entries are always written.
+        """
+        is_first = not self._run_log_done
+        self._run_log_done = True
         try:
-            thehive.log_to_task(case_id, LOG_TASK_GROUP, LOG_TASK_TITLE, message)
+            thehive.log_to_task(case_id, LOG_TASK_GROUP, LOG_TASK_TITLE, message, dedup=is_first)
         except TheHiveError:
             pass
 
@@ -103,6 +110,7 @@ class DCSyncWhitelistResponder(Responder):
         self.error(message)
 
     def run(self):
+        self._run_log_done = False  # reset each run; first _log call gets dedup, rest bypass it
         case_id = None
         thehive = None
         try:

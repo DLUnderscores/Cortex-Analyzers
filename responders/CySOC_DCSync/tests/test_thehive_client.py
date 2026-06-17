@@ -16,15 +16,36 @@ def query_router(**responses):
     return _route
 
 
-def test_close_case_false_positive_never_touches_summary(fake_http):
+def test_close_case_false_positive_reopens_then_resolves(fake_http):
     fake_http.route("PATCH", f"/api/case/{CASE_ID}", FakeResponse(200, {}))
     client = TheHiveClient("http://thehive", "key", http=fake_http)
 
     client.close_case_false_positive(CASE_ID)
 
-    body = fake_http.calls[-1]["json"]
-    assert "summary" not in body
-    assert body == {"status": "Resolved", "resolutionStatus": "FalsePositive", "impactStatus": "NotApplicable"}
+    patch_calls = [c for c in fake_http.calls if c["method"] == "PATCH"]
+    assert len(patch_calls) == 2
+    assert patch_calls[0]["json"] == {"status": "Open"}
+    fp_body = patch_calls[1]["json"]
+    assert "summary" not in fp_body
+    assert fp_body == {"status": "Resolved", "resolutionStatus": "FalsePositive", "impactStatus": "NotApplicable"}
+
+
+def test_close_case_false_positive_succeeds_even_if_reopen_fails(fake_http):
+    call_count = {"n": 0}
+
+    def patch_response(**kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return FakeResponse(400, text="already open")
+        return FakeResponse(200, {})
+
+    fake_http.route("PATCH", f"/api/case/{CASE_ID}", patch_response)
+    client = TheHiveClient("http://thehive", "key", http=fake_http)
+
+    client.close_case_false_positive(CASE_ID)  # must not raise
+
+    fp_body = fake_http.calls[-1]["json"]
+    assert fp_body["resolutionStatus"] == "FalsePositive"
 
 
 def test_close_case_true_positive_never_touches_summary(fake_http):
@@ -159,6 +180,29 @@ def test_log_to_task_skips_exact_duplicate_of_last_message(fake_http):
     client.log_to_task(CASE_ID, "CySOC", "Log", "hello")
 
     assert not any(c["url"].endswith(f"{TASK_ID}/log") for c in fake_http.calls)
+
+
+def test_log_to_task_skips_dedup_check_when_dedup_false(fake_http):
+    fake_http.route(
+        "POST",
+        "/api/v1/query",
+        query_router(
+            **{
+                "case-tasks": FakeResponse(200, [{"_id": TASK_ID, "group": "CySOC", "title": "Log", "status": "Completed"}]),
+            }
+        ),
+    )
+    fake_http.route("POST", f"/api/case/task/{TASK_ID}/log", FakeResponse(200, {}))
+    client = TheHiveClient("http://thehive", "key", http=fake_http)
+
+    client.log_to_task(CASE_ID, "CySOC", "Log", "repeated message", dedup=False)
+
+    log_calls = [c for c in fake_http.calls if c["url"].endswith(f"{TASK_ID}/log")]
+    assert len(log_calls) == 1
+    assert log_calls[0]["json"] == {"message": "repeated message"}
+    # No query for task-logs was made — dedup check was skipped entirely
+    query_calls = [c for c in fake_http.calls if "/api/v1/query" in c["url"]]
+    assert not any(c.get("params", {}).get("name") == "task-logs" for query_calls in [query_calls] for c in query_calls)
 
 
 def test_log_to_task_writes_when_different_from_last(fake_http):

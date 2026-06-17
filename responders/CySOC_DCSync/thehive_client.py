@@ -45,6 +45,18 @@ class TheHiveClient:
     def close_case_false_positive(self, case_id: str) -> None:
         # No "summary" field here — the case Summary is analyst-owned; the decision is logged
         # to the Log task instead (see DCSyncWhitelistResponder._log).
+        #
+        # Reopen first (best-effort, errors ignored): TheHive v4 does not update resolutionStatus
+        # when status is already "Resolved", so re-closing a case that was previously closed with
+        # a different verdict (e.g. TruePositive → FalsePositive) requires transitioning through
+        # Open first.
+        self.http.patch(
+            f"{self.url}/api/case/{case_id}",
+            headers=self.headers,
+            json={"status": "Open"},
+            verify=self.verify,
+            timeout=30,
+        )
         body = {
             "status": "Resolved",
             "resolutionStatus": "FalsePositive",
@@ -167,13 +179,16 @@ class TheHiveClient:
         entries = resp.json() or []
         return entries[0].get("message") if entries else None
 
-    def log_to_task(self, case_id: str, group: str, title: str, message: str) -> None:
+    def log_to_task(self, case_id: str, group: str, title: str, message: str, dedup: bool = True) -> None:
         """Find-or-create the (group, title) task on the case and append a log entry to it.
 
-        Skipped if it would be an exact duplicate of the task's most recent entry, so re-running
-        a job that lands on the same verdict doesn't spam the task with repeated identical lines.
+        When dedup=True (default), skipped if the message is an exact duplicate of the task's most
+        recent entry — prevents re-running a job with the same outcome from repeating the same line.
+        Pass dedup=False for all entries after the first in a single run: the first entry guards
+        against repeating the run-level verdict, while subsequent per-action entries should always
+        be written regardless.
         """
         task_id = self.get_or_create_task(case_id, group, title)
-        if self.get_last_task_log_message(task_id) == message:
+        if dedup and self.get_last_task_log_message(task_id) == message:
             return
         self.add_task_log(task_id, message)
