@@ -15,7 +15,7 @@
     },
     "configurationItems": [
         {
-            "name": "thehive_url",
+            "name": "TheHive URL",
             "description": "TheHive base URL",
             "type": "string",
             "multi": false,
@@ -23,7 +23,7 @@
             "defaultValue": ""
         },
         {
-            "name": "thehive_api_key",
+            "name": "TheHive API key",
             "description": "TheHive API key with permission to read observables and close cases",
             "type": "string",
             "multi": false,
@@ -31,7 +31,7 @@
             "defaultValue": ""
         },
         {
-            "name": "consul_url",
+            "name": "Consul URL",
             "description": "Consul HTTP API base URL",
             "type": "string",
             "multi": false,
@@ -39,7 +39,7 @@
             "defaultValue": "http://consul.service.consul:8500"
         },
         {
-            "name": "consul_kv_whitelist",
+            "name": "Consul KV whitelist",
             "description": "Exact Consul KV path to the whitelist key (a single key holding a YAML document, not a directory prefix)",
             "type": "string",
             "multi": false,
@@ -47,7 +47,7 @@
             "defaultValue": ""
         },
         {
-            "name": "consul_token",
+            "name": "Consul ACL token",
             "description": "Consul ACL token (optional)",
             "type": "string",
             "multi": false,

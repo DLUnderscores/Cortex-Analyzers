@@ -53,24 +53,24 @@ class DCSyncWhitelistResponder(Responder):
     def __init__(self, job_directory=None):
         Responder.__init__(self, job_directory)
         self.service = self.get_param("config.service", None, "Service parameter is missing")
-        self.thehive_url = self.get_param("config.thehive_url", None, "TheHive URL is missing")
-        self.thehive_api_key = self.get_param("config.thehive_api_key", None, "TheHive API key is missing")
-        self.consul_url = self.get_param("config.consul_url", "http://consul.service.consul:8500")
+        self.thehive_url = self.get_param("config.TheHive URL", None, "TheHive URL is missing")
+        self.thehive_api_key = self.get_param("config.TheHive API key", None, "TheHive API key is missing")
+        self.consul_url = self.get_param("config.Consul URL", "http://consul.service.consul:8500")
         # Optional for "check" — an unconfigured whitelist fails safe to "not whitelisted"
         # rather than blocking the job. Required for "update" (enforced in run()).
-        self.consul_kv_whitelist = self.get_param("config.consul_kv_whitelist", None)
-        self.consul_token = self.get_param("config.consul_token", None)
-        self.close_on_fp = self.get_param("config.close_on_fp", True)
-        # Containment actions on true-positive, off by default. tenant_id/client_id/
-        # client_secret are only required when one of these is enabled (checked in run()).
-        self.tenant_id = self.get_param("config.tenant_id", None)
-        self.client_id = self.get_param("config.client_id", None)
-        self.client_secret = self.get_param("config.client_secret", None)
-        self.disable_user_on_tp = self.get_param("config.disable_user_on_tp", False)
-        self.force_password_reset_on_tp = self.get_param("config.force_password_reset_on_tp", False)
-        self.revoke_sessions_on_tp = self.get_param("config.revoke_sessions_on_tp", False)
-        self.isolate_device_on_tp = self.get_param("config.isolate_device_on_tp", False)
-        self.full_isolation = self.get_param("config.full_isolation", False)
+        self.consul_kv_whitelist = self.get_param("config.Consul KV whitelist", None)
+        self.consul_token = self.get_param("config.Consul ACL token", None)
+        self.close_on_fp = self.get_param("config.Close on false positive", True)
+        # Containment actions on true-positive, off by default. Azure credentials are only
+        # required when one of these is enabled (checked in run()).
+        self.tenant_id = self.get_param("config.Azure tenant ID", None)
+        self.client_id = self.get_param("config.Azure app client ID", None)
+        self.client_secret = self.get_param("config.Azure app client secret", None)
+        self.disable_user_on_tp = self.get_param("config.Disable user on true positive", False)
+        self.force_password_reset_on_tp = self.get_param("config.Force password reset on true positive", False)
+        self.revoke_sessions_on_tp = self.get_param("config.Revoke sessions on true positive", False)
+        self.isolate_device_on_tp = self.get_param("config.Isolate device on true positive", False)
+        self.full_isolation = self.get_param("config.Full isolation", False)
 
     # Factories kept separate so tests can substitute fakes.
     def _thehive(self):
@@ -146,8 +146,8 @@ class DCSyncWhitelistResponder(Responder):
                     self._fail(
                         thehive,
                         case_id,
-                        "tenant_id/client_id/client_secret are required when disable_user_on_tp or "
-                        "isolate_device_on_tp is enabled",
+                        "Azure tenant ID / Azure app client ID / Azure app client secret are required "
+                        "when any true-positive containment action is enabled",
                     )
                 whitelist = self._whitelist() if self.consul_kv_whitelist else None
                 defender = self._defender() if actions_enabled else None

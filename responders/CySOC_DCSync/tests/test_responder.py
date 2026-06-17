@@ -122,10 +122,10 @@ class ResponderUnderTest(DCSyncWhitelistResponder):
 def write_job(tmp_path, service, case=CASE, config_overrides=None):
     config = {
         "service": service,
-        "thehive_url": "http://thehive",
-        "thehive_api_key": "key",
-        "consul_url": "http://consul:8500",
-        "consul_kv_whitelist": "cysoc/office/sirp/dcsync/whitelist",
+        "TheHive URL": "http://thehive",
+        "TheHive API key": "key",
+        "Consul URL": "http://consul:8500",
+        "Consul KV whitelist": "cysoc/office/sirp/dcsync/whitelist",
     }
     config.update(config_overrides or {})
     (tmp_path / "input").mkdir()
@@ -187,7 +187,7 @@ def test_check_all_pairs_whitelisted_closes_case_as_fp(tmp_path):
 
 
 def test_check_fp_without_closing_when_disabled(tmp_path):
-    write_job(tmp_path, "check", config_overrides={"close_on_fp": False})
+    write_job(tmp_path, "check", config_overrides={"Close on false positive": False})
     thehive = StubTheHive(OBSERVABLES)
     output = run_responder(tmp_path, thehive, StubWhitelist({PAIR_KEY: {}}))
 
@@ -209,7 +209,7 @@ def test_check_unknown_pair_is_true_positive(tmp_path):
 
 
 def test_check_treats_missing_whitelist_config_as_not_whitelisted(tmp_path):
-    write_job(tmp_path, "check", config_overrides={"consul_kv_whitelist": ""})
+    write_job(tmp_path, "check", config_overrides={"Consul KV whitelist": ""})
     thehive = StubTheHive(OBSERVABLES)
     # stub has the pair whitelisted, but it must never be consulted without a configured key
     output = run_responder(tmp_path, thehive, StubWhitelist({PAIR_KEY: {"account": "svc-sync"}}))
@@ -222,7 +222,7 @@ def test_check_treats_missing_whitelist_config_as_not_whitelisted(tmp_path):
 
 
 def test_update_requires_whitelist_config(tmp_path):
-    write_job(tmp_path, "update", config_overrides={"consul_kv_whitelist": ""})
+    write_job(tmp_path, "update", config_overrides={"Consul KV whitelist": ""})
     thehive = StubTheHive(OBSERVABLES)
 
     with pytest.raises(SystemExit):
@@ -286,13 +286,13 @@ def test_check_containment_actions_only_target_non_whitelisted_pair(tmp_path):
         tmp_path,
         "check",
         config_overrides={
-            "disable_user_on_tp": True,
-            "force_password_reset_on_tp": True,
-            "revoke_sessions_on_tp": True,
-            "isolate_device_on_tp": True,
-            "tenant_id": "t",
-            "client_id": "c",
-            "client_secret": "s",
+            "Disable user on true positive": True,
+            "Force password reset on true positive": True,
+            "Revoke sessions on true positive": True,
+            "Isolate device on true positive": True,
+            "Azure tenant ID": "t",
+            "Azure app client ID": "c",
+            "Azure app client secret": "s",
         },
     )
     thehive = StubTheHive(two_user_one_host_observables())
@@ -321,7 +321,7 @@ def test_check_case_not_closed_when_an_action_fails(tmp_path):
     write_job(
         tmp_path,
         "check",
-        config_overrides={"disable_user_on_tp": True, "tenant_id": "t", "client_id": "c", "client_secret": "s"},
+        config_overrides={"Disable user on true positive": True, "Azure tenant ID": "t", "Azure app client ID": "c", "Azure app client secret": "s"},
     )
     thehive = StubTheHive(two_user_one_host_observables())
     whitelist = StubWhitelist({pair_key(USER1_GUID, LAB1_DEVICE_ID): {"account": "user1"}})
@@ -344,12 +344,12 @@ def test_check_graph_actions_skipped_for_onprem_only_id(tmp_path):
         tmp_path,
         "check",
         config_overrides={
-            "disable_user_on_tp": True,
-            "force_password_reset_on_tp": True,
-            "revoke_sessions_on_tp": True,
-            "tenant_id": "t",
-            "client_id": "c",
-            "client_secret": "s",
+            "Disable user on true positive": True,
+            "Force password reset on true positive": True,
+            "Revoke sessions on true positive": True,
+            "Azure tenant ID": "t",
+            "Azure app client ID": "c",
+            "Azure app client secret": "s",
         },
     )
     onprem_obs = [
@@ -391,12 +391,12 @@ def test_check_user_iterated_once_per_action_type(tmp_path):
         tmp_path,
         "check",
         config_overrides={
-            "disable_user_on_tp": True,
-            "force_password_reset_on_tp": True,
-            "revoke_sessions_on_tp": True,
-            "tenant_id": "t",
-            "client_id": "c",
-            "client_secret": "s",
+            "Disable user on true positive": True,
+            "Force password reset on true positive": True,
+            "Revoke sessions on true positive": True,
+            "Azure tenant ID": "t",
+            "Azure app client ID": "c",
+            "Azure app client secret": "s",
         },
     )
     thehive = StubTheHive(two_user_one_host_observables())
@@ -411,7 +411,7 @@ def test_check_user_iterated_once_per_action_type(tmp_path):
 
 
 def test_check_requires_defender_credentials_when_action_enabled(tmp_path):
-    write_job(tmp_path, "check", config_overrides={"disable_user_on_tp": True})
+    write_job(tmp_path, "check", config_overrides={"Disable user on true positive": True})
     thehive = StubTheHive(OBSERVABLES)
 
     with pytest.raises(SystemExit):
@@ -419,7 +419,7 @@ def test_check_requires_defender_credentials_when_action_enabled(tmp_path):
 
     output = read_output(tmp_path)
     assert output["success"] is False
-    assert "tenant_id" in output["errorMessage"]
+    assert "Azure tenant ID" in output["errorMessage"]
 
 
 def test_check_fails_safe_when_no_pair_found(tmp_path):
