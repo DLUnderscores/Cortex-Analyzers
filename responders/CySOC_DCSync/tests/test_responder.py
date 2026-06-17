@@ -75,6 +75,8 @@ class StubWhitelist:
 class StubDefender:
     def __init__(self, fail_users=(), fail_devices=()):
         self.disabled = []
+        self.password_resets = []
+        self.revoked = []
         self.isolated = []  # (device_id, full)
         self.fail_users = set(fail_users)
         self.fail_devices = set(fail_devices)
@@ -83,6 +85,16 @@ class StubDefender:
         if user_id in self.fail_users:
             raise DefenderActionError(f"failed to disable {user_id}")
         self.disabled.append(user_id)
+
+    def force_password_reset(self, user_id):
+        if user_id in self.fail_users:
+            raise DefenderActionError(f"failed to reset password for {user_id}")
+        self.password_resets.append(user_id)
+
+    def revoke_sessions(self, user_id):
+        if user_id in self.fail_users:
+            raise DefenderActionError(f"failed to revoke sessions for {user_id}")
+        self.revoked.append(user_id)
 
     def isolate_device(self, device_id, comment, full=False):
         if device_id in self.fail_devices:
@@ -275,6 +287,8 @@ def test_check_containment_actions_only_target_non_whitelisted_pair(tmp_path):
         "check",
         config_overrides={
             "disable_user_on_tp": True,
+            "force_password_reset_on_tp": True,
+            "revoke_sessions_on_tp": True,
             "isolate_device_on_tp": True,
             "tenant_id": "t",
             "client_id": "c",
@@ -290,8 +304,17 @@ def test_check_containment_actions_only_target_non_whitelisted_pair(tmp_path):
     assert output["full"]["verdict"] == "true-positive"
     assert output["full"]["case_closed"] is True
     assert defender.disabled == [USER2_GUID]
+    assert defender.password_resets == [USER2_GUID]
+    assert defender.revoked == [USER2_GUID]
     assert defender.isolated == [(LAB1_DEVICE_ID, False)]
     assert thehive.closed[0] == ("~4128", "true-positive")
+    log_messages = [entry[3] for entry in thehive.logs]
+    assert any("account disabled in Entra" in m and "user2" in m for m in log_messages)
+    assert any("password reset forced in Entra" in m and "user2" in m for m in log_messages)
+    assert any("sign-in sessions revoked in Entra" in m and "user2" in m for m in log_messages)
+    assert any("device isolated (Selective) in MDE" in m and "lab1" in m for m in log_messages)
+    assert any("closed automatically as a true-positive" in m for m in log_messages)
+    assert not any("user1" in m for m in log_messages)  # whitelisted user must never appear
 
 
 def test_check_case_not_closed_when_an_action_fails(tmp_path):
@@ -309,17 +332,27 @@ def test_check_case_not_closed_when_an_action_fails(tmp_path):
     assert output["full"]["verdict"] == "true-positive"
     assert output["full"]["case_closed"] is False
     assert thehive.closed == []
-    assert "NOT closed" in thehive.logs[0][3]
-    assert "FAILED" in thehive.logs[0][3]
+    log_messages = [entry[3] for entry in thehive.logs]
+    # action failure has its own log entry
+    assert any("FAILED to disable account in Entra" in m and "user2" in m for m in log_messages)
+    # verdict entry says case not closed
+    assert any("NOT closed" in m for m in log_messages)
 
 
-def test_check_disable_user_skipped_for_onprem_only_id(tmp_path):
+def test_check_graph_actions_skipped_for_onprem_only_id(tmp_path):
     write_job(
         tmp_path,
         "check",
-        config_overrides={"disable_user_on_tp": True, "tenant_id": "t", "client_id": "c", "client_secret": "s"},
+        config_overrides={
+            "disable_user_on_tp": True,
+            "force_password_reset_on_tp": True,
+            "revoke_sessions_on_tp": True,
+            "tenant_id": "t",
+            "client_id": "c",
+            "client_secret": "s",
+        },
     )
-    observables = [
+    onprem_obs = [
         OBSERVABLES[0],
         {
             "dataType": "username",
@@ -332,15 +365,49 @@ def test_check_disable_user_skipped_for_onprem_only_id(tmp_path):
             },
         },
     ]
-    thehive = StubTheHive(observables)
+    thehive = StubTheHive(onprem_obs)
     defender = StubDefender()
 
     output = run_responder(tmp_path, thehive, StubWhitelist(), defender)
 
     assert output["full"]["case_closed"] is False
     assert defender.disabled == []
-    assert output["full"]["actions"][0]["success"] is False
-    assert "on-prem" in output["full"]["actions"][0]["detail"]
+    assert defender.password_resets == []
+    assert defender.revoked == []
+    # all three Graph actions should be recorded as failures (one per action type)
+    failed = [a for a in output["full"]["actions"] if not a["success"]]
+    assert len(failed) == 3
+    assert all("on-prem" in a["detail"] for a in failed)
+    log_messages = [entry[3] for entry in thehive.logs]
+    assert any("FAILED to disable account in Entra" in m for m in log_messages)
+    assert any("FAILED to force password reset in Entra" in m for m in log_messages)
+    assert any("FAILED to revoke sign-in sessions in Entra" in m for m in log_messages)
+    assert any("NOT closed" in m for m in log_messages)
+
+
+def test_check_user_iterated_once_per_action_type(tmp_path):
+    # Two users paired with the same host — both should be acted on exactly once per action, not once per pair.
+    write_job(
+        tmp_path,
+        "check",
+        config_overrides={
+            "disable_user_on_tp": True,
+            "force_password_reset_on_tp": True,
+            "revoke_sessions_on_tp": True,
+            "tenant_id": "t",
+            "client_id": "c",
+            "client_secret": "s",
+        },
+    )
+    thehive = StubTheHive(two_user_one_host_observables())
+    defender = StubDefender()
+
+    run_responder(tmp_path, thehive, StubWhitelist(), defender)
+
+    # Both users present, acted on exactly once each per action type
+    assert sorted(defender.disabled) == sorted([USER1_GUID, USER2_GUID])
+    assert sorted(defender.password_resets) == sorted([USER1_GUID, USER2_GUID])
+    assert sorted(defender.revoked) == sorted([USER1_GUID, USER2_GUID])
 
 
 def test_check_requires_defender_credentials_when_action_enabled(tmp_path):

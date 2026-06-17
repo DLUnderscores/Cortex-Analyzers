@@ -59,6 +59,29 @@ class DefenderClient:
         if not (200 <= resp.status_code < 300):
             raise DefenderActionError(f"Failed to disable user {user_id}: HTTP {resp.status_code} — {resp.text}")
 
+    def force_password_reset(self, user_id: str) -> None:
+        resp = self.http.patch(
+            f"{GRAPH_BASE_URL}/users/{user_id}",
+            headers={"Authorization": f"Bearer {self._token(GRAPH_SCOPE)}", "Content-Type": "application/json"},
+            json={"passwordProfile": {"forceChangePasswordNextSignIn": True}},
+            timeout=30,
+        )
+        if not (200 <= resp.status_code < 300):
+            raise DefenderActionError(
+                f"Failed to force password reset for user {user_id}: HTTP {resp.status_code} — {resp.text}"
+            )
+
+    def revoke_sessions(self, user_id: str) -> None:
+        resp = self.http.post(
+            f"{GRAPH_BASE_URL}/users/{user_id}/revokeSignInSessions",
+            headers={"Authorization": f"Bearer {self._token(GRAPH_SCOPE)}", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        if not (200 <= resp.status_code < 300):
+            raise DefenderActionError(
+                f"Failed to revoke sign-in sessions for user {user_id}: HTTP {resp.status_code} — {resp.text}"
+            )
+
     def isolate_device(self, device_id: str, comment: str, full: bool = False) -> None:
         resp = self.http.post(
             f"{MDE_BASE_URL}/machines/{device_id}/isolate",

@@ -83,6 +83,46 @@ def test_token_is_cached_per_scope(fake_http):
     assert token_calls["count"] == 1
 
 
+def test_force_password_reset_success(fake_http):
+    token_route(fake_http)
+    fake_http.route("PATCH", f"/users/{USER_ID}", FakeResponse(200, {}))
+    client = DefenderClient(TENANT_ID, "client", "secret", http=fake_http)
+
+    client.force_password_reset(USER_ID)
+
+    call = fake_http.calls[-1]
+    assert call["json"] == {"passwordProfile": {"forceChangePasswordNextSignIn": True}}
+
+
+def test_force_password_reset_raises_on_error(fake_http):
+    token_route(fake_http)
+    fake_http.route("PATCH", f"/users/{USER_ID}", FakeResponse(403, text="forbidden"))
+    client = DefenderClient(TENANT_ID, "client", "secret", http=fake_http)
+
+    with pytest.raises(DefenderActionError):
+        client.force_password_reset(USER_ID)
+
+
+def test_revoke_sessions_success(fake_http):
+    token_route(fake_http)
+    fake_http.route("POST", f"/users/{USER_ID}/revokeSignInSessions", FakeResponse(200, {"value": True}))
+    client = DefenderClient(TENANT_ID, "client", "secret", http=fake_http)
+
+    client.revoke_sessions(USER_ID)
+
+    call = fake_http.calls[-1]
+    assert f"/users/{USER_ID}/revokeSignInSessions" in call["url"]
+
+
+def test_revoke_sessions_raises_on_error(fake_http):
+    token_route(fake_http)
+    fake_http.route("POST", f"/users/{USER_ID}/revokeSignInSessions", FakeResponse(403, text="forbidden"))
+    client = DefenderClient(TENANT_ID, "client", "secret", http=fake_http)
+
+    with pytest.raises(DefenderActionError):
+        client.revoke_sessions(USER_ID)
+
+
 def test_token_request_failure_raises(fake_http):
     fake_http.route("POST", f"/{TENANT_ID}/oauth2/v2.0/token", FakeResponse(401, text="bad creds"))
     client = DefenderClient(TENANT_ID, "client", "secret", http=fake_http)

@@ -67,6 +67,8 @@ class DCSyncWhitelistResponder(Responder):
         self.client_id = self.get_param("config.client_id", None)
         self.client_secret = self.get_param("config.client_secret", None)
         self.disable_user_on_tp = self.get_param("config.disable_user_on_tp", False)
+        self.force_password_reset_on_tp = self.get_param("config.force_password_reset_on_tp", False)
+        self.revoke_sessions_on_tp = self.get_param("config.revoke_sessions_on_tp", False)
         self.isolate_device_on_tp = self.get_param("config.isolate_device_on_tp", False)
         self.full_isolation = self.get_param("config.full_isolation", False)
 
@@ -126,7 +128,12 @@ class DCSyncWhitelistResponder(Responder):
                 )
 
             if self.service == "check":
-                actions_enabled = self.disable_user_on_tp or self.isolate_device_on_tp
+                actions_enabled = (
+                    self.disable_user_on_tp
+                    or self.force_password_reset_on_tp
+                    or self.revoke_sessions_on_tp
+                    or self.isolate_device_on_tp
+                )
                 if actions_enabled and not (self.tenant_id and self.client_id and self.client_secret):
                     self._fail(
                         thehive,
@@ -151,49 +158,67 @@ class DCSyncWhitelistResponder(Responder):
             self._log_failure(thehive, case_id, f"unexpected error: {exc}")
             self.error(traceback.format_exc())
 
+    @staticmethod
+    def _unique_users(unmatched):
+        """Deduplicate users from unmatched pairs, preserving first-occurrence order."""
+        seen = {}
+        for pair in unmatched:
+            seen.setdefault(pair["user_id"], {"display": pair["user"], "predicate": pair["user_id_predicate"]})
+        return seen
+
+    @staticmethod
+    def _try_graph_action(action_type, users, fn):
+        """Run fn(user_id) for each unique user; checks Account_Object_ID predicate first."""
+        results = []
+        for user_id, info in users.items():
+            if info["predicate"] != "Account_Object_ID":
+                results.append(
+                    {
+                        "type": action_type,
+                        "target": info["display"],
+                        "id": user_id,
+                        "success": False,
+                        "detail": "no Entra account id available (only on-prem AD id resolved)",
+                    }
+                )
+                continue
+            try:
+                fn(user_id)
+                results.append(
+                    {"type": action_type, "target": info["display"], "id": user_id, "success": True, "detail": None}
+                )
+            except DefenderActionError as exc:
+                results.append(
+                    {
+                        "type": action_type,
+                        "target": info["display"],
+                        "id": user_id,
+                        "success": False,
+                        "detail": str(exc),
+                    }
+                )
+        return results
+
     def _containment_actions(self, defender, case, unmatched):
         """Run the configured containment actions on the unmatched (non-whitelisted) pairs only.
 
-        Returns (actions, all_succeeded); all_succeeded is vacuously True when neither
-        disable_user_on_tp nor isolate_device_on_tp is enabled.
+        Actions execute in order: disable_user → force_password_reset → revoke_sessions → isolate_device.
+        Returns (actions, all_succeeded); all_succeeded is vacuously True when no action is enabled.
         """
         actions = []
 
-        if self.disable_user_on_tp:
-            users = {}
-            for pair in unmatched:
-                users.setdefault(
-                    pair["user_id"], {"display": pair["user"], "predicate": pair["user_id_predicate"]}
-                )
-            for user_id, info in users.items():
-                if info["predicate"] != "Account_Object_ID":
-                    actions.append(
-                        {
-                            "type": "disable_user",
-                            "target": info["display"],
-                            "id": user_id,
-                            "success": False,
-                            "detail": "no Entra account id available (only on-prem AD id resolved)",
-                        }
-                    )
-                    continue
-                try:
-                    defender.disable_user(user_id)
-                    actions.append(
-                        {"type": "disable_user", "target": info["display"], "id": user_id, "success": True, "detail": None}
-                    )
-                except DefenderActionError as exc:
-                    actions.append(
-                        {
-                            "type": "disable_user",
-                            "target": info["display"],
-                            "id": user_id,
-                            "success": False,
-                            "detail": str(exc),
-                        }
-                    )
+        any_user_action = self.disable_user_on_tp or self.force_password_reset_on_tp or self.revoke_sessions_on_tp
+        if any_user_action:
+            users = self._unique_users(unmatched)
+            if self.disable_user_on_tp:
+                actions.extend(self._try_graph_action("disable_user", users, defender.disable_user))
+            if self.force_password_reset_on_tp:
+                actions.extend(self._try_graph_action("force_password_reset", users, defender.force_password_reset))
+            if self.revoke_sessions_on_tp:
+                actions.extend(self._try_graph_action("revoke_sessions", users, defender.revoke_sessions))
 
         if self.isolate_device_on_tp:
+            isolation_type = "Full" if self.full_isolation else "Selective"
             devices = {}
             for pair in unmatched:
                 devices.setdefault(pair["device_id"], pair["host"])
@@ -202,7 +227,14 @@ class DCSyncWhitelistResponder(Responder):
                 try:
                     defender.isolate_device(device_id, comment, full=self.full_isolation)
                     actions.append(
-                        {"type": "isolate_device", "target": host, "id": device_id, "success": True, "detail": None}
+                        {
+                            "type": "isolate_device",
+                            "target": host,
+                            "id": device_id,
+                            "success": True,
+                            "detail": None,
+                            "isolation_type": isolation_type,
+                        }
                     )
                 except DefenderActionError as exc:
                     actions.append(
@@ -212,10 +244,44 @@ class DCSyncWhitelistResponder(Responder):
                             "id": device_id,
                             "success": False,
                             "detail": str(exc),
+                            "isolation_type": isolation_type,
                         }
                     )
 
         return actions, all(a["success"] for a in actions)
+
+    def _log_action(self, thehive, case_id, action):
+        """Log a single containment action result as its own task log entry."""
+        prefix = LOG_PREFIX["check"]
+        t, tgt, uid, ok, detail = (
+            action["type"], action["target"], action["id"], action["success"], action.get("detail")
+        )
+        if t == "disable_user":
+            msg = (
+                f"{prefix}: account disabled in Entra — {tgt} ({uid})"
+                if ok else
+                f"{prefix}: FAILED to disable account in Entra — {tgt} ({uid}): {detail}"
+            )
+        elif t == "force_password_reset":
+            msg = (
+                f"{prefix}: password reset forced in Entra — {tgt} ({uid})"
+                if ok else
+                f"{prefix}: FAILED to force password reset in Entra — {tgt} ({uid}): {detail}"
+            )
+        elif t == "revoke_sessions":
+            msg = (
+                f"{prefix}: sign-in sessions revoked in Entra — {tgt} ({uid})"
+                if ok else
+                f"{prefix}: FAILED to revoke sign-in sessions in Entra — {tgt} ({uid}): {detail}"
+            )
+        else:
+            isolation_type = action.get("isolation_type", "Selective")
+            msg = (
+                f"{prefix}: device isolated ({isolation_type}) in MDE — {tgt} ({uid})"
+                if ok else
+                f"{prefix}: FAILED to isolate device in MDE — {tgt} ({uid}): {detail}"
+            )
+        self._log(thehive, case_id, msg)
 
     def check(self, case, case_id, thehive, whitelist, defender, pairs, pair_selection):
         entries = whitelist.entries() if whitelist else {}
@@ -240,10 +306,8 @@ class DCSyncWhitelistResponder(Responder):
                 f"{p['user']}@{p['host']}" for p in unmatched
             )
             actions, all_succeeded = self._containment_actions(defender, case, unmatched)
-            action_summary = "; ".join(
-                f"{a['type']}: {a['target']} ({'success' if a['success'] else 'FAILED — ' + a['detail']})"
-                for a in actions
-            )
+            for action in actions:
+                self._log_action(thehive, case_id, action)
             if all_succeeded:
                 thehive.close_case_true_positive(case_id)
                 case_closed = True
@@ -253,8 +317,6 @@ class DCSyncWhitelistResponder(Responder):
                     f"{LOG_PREFIX['check']}: true-positive, NOT closed — one or more containment actions "
                     f"failed — {base_message}"
                 )
-            if action_summary:
-                log_message += "; " + action_summary
         else:
             verdict = "false-positive"
             whitelisted = ", ".join(f"{p['user']}@{p['host']}" for p in matched)

@@ -88,7 +88,23 @@
         },
         {
             "name": "disable_user_on_tp",
-            "description": "On true-positive, disable the Entra account of every non-whitelisted user via Microsoft Graph",
+            "description": "On true-positive, disable the Entra account of every non-whitelisted user via Microsoft Graph (requires User.EnableDisableAccount.All + User.Read.All)",
+            "type": "boolean",
+            "multi": false,
+            "required": false,
+            "defaultValue": false
+        },
+        {
+            "name": "force_password_reset_on_tp",
+            "description": "On true-positive, force a password change at next sign-in for every non-whitelisted user via Microsoft Graph (requires User.ReadWrite.All)",
+            "type": "boolean",
+            "multi": false,
+            "required": false,
+            "defaultValue": false
+        },
+        {
+            "name": "revoke_sessions_on_tp",
+            "description": "On true-positive, revoke all active sign-in sessions (refresh tokens + session cookies) for every non-whitelisted user via Microsoft Graph (requires User.RevokeSessions.All or User.ReadWrite.All)",
             "type": "boolean",
             "multi": false,
             "required": false,
