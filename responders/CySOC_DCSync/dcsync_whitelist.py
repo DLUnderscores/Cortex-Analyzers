@@ -4,14 +4,24 @@
 
 check:  Evaluate every (user, host) pair derived from the case observables
         against the Consul KV whitelist. All pairs whitelisted → closes the
-        case as a false positive (optional); any pair unknown → closes the
-        case as a true positive. Canonical ids come exclusively from the
-        MicrosoftDefender enrichment reports attached to the observables; an
-        observable without enrichment fails the job (fail-safe: the case is
-        never closed on incomplete information). If the whitelist itself
-        isn't configured, the case is left open instead of being closed as a
-        true positive, since "couldn't check" isn't the same as "checked and
+        case as a false positive (optional); any pair unknown → optionally
+        disables the user's Entra account and/or isolates the source device
+        (only the non-whitelisted users/devices — see below), then closes
+        the case as a true positive only if every attempted action
+        succeeded. Canonical ids come exclusively from the MicrosoftDefender
+        enrichment reports attached to the observables; an observable
+        without enrichment fails the job (fail-safe: the case is never
+        closed on incomplete information). If the whitelist itself isn't
+        configured, the case is left open instead of being closed as a true
+        positive, since "couldn't check" isn't the same as "checked and
         it's bad".
+
+        Containment actions (disable_user_on_tp / isolate_device_on_tp) are
+        derived only from the non-whitelisted ("unmatched") pairs, so a
+        whitelisted user/device sharing a case with a non-whitelisted one is
+        never touched. Both are off by default; neither is attempted when
+        the verdict is false-positive (there are no unmatched pairs then) or
+        when the whitelist isn't configured (fail-safe — see above).
 
 update: Write every (user, host) pair of the case to the whitelist and close
         the case as a false positive. Run by the analyst after a true
@@ -19,14 +29,16 @@ update: Write every (user, host) pair of the case to the whitelist and close
 
 Both services append a one-line summary of the decision to a TheHive task
 (group "CySOC", title "Log"), creating it on the case if it doesn't exist
-yet, so analysts can see why a case was auto-closed without digging through
-the responder job output.
+yet, so analysts can see why a case was auto-closed (or why it wasn't, e.g.
+a containment action failed) without digging through the responder job
+output.
 """
 import traceback
 from datetime import datetime, timezone
 
 from cortexutils.responder import Responder
 
+from defender_client import DefenderActionError, DefenderClient
 from thehive_client import TheHiveClient, TheHiveError
 from whitelist import ConsulKVError, ConsulWhitelist, PairResolver
 
@@ -49,6 +61,14 @@ class DCSyncWhitelistResponder(Responder):
         self.consul_kv_whitelist = self.get_param("config.consul_kv_whitelist", None)
         self.consul_token = self.get_param("config.consul_token", None)
         self.close_on_fp = self.get_param("config.close_on_fp", True)
+        # Containment actions on true-positive, off by default. tenant_id/client_id/
+        # client_secret are only required when one of these is enabled (checked in run()).
+        self.tenant_id = self.get_param("config.tenant_id", None)
+        self.client_id = self.get_param("config.client_id", None)
+        self.client_secret = self.get_param("config.client_secret", None)
+        self.disable_user_on_tp = self.get_param("config.disable_user_on_tp", False)
+        self.isolate_device_on_tp = self.get_param("config.isolate_device_on_tp", False)
+        self.full_isolation = self.get_param("config.full_isolation", False)
 
     # Factories kept separate so tests can substitute fakes.
     def _thehive(self):
@@ -56,6 +76,9 @@ class DCSyncWhitelistResponder(Responder):
 
     def _whitelist(self):
         return ConsulWhitelist(self.consul_url, self.consul_kv_whitelist, token=self.consul_token)
+
+    def _defender(self):
+        return DefenderClient(self.tenant_id, self.client_id, self.client_secret)
 
     def _resolver(self):
         return PairResolver()
@@ -103,15 +126,24 @@ class DCSyncWhitelistResponder(Responder):
                 )
 
             if self.service == "check":
+                actions_enabled = self.disable_user_on_tp or self.isolate_device_on_tp
+                if actions_enabled and not (self.tenant_id and self.client_id and self.client_secret):
+                    self._fail(
+                        thehive,
+                        case_id,
+                        "tenant_id/client_id/client_secret are required when disable_user_on_tp or "
+                        "isolate_device_on_tp is enabled",
+                    )
                 whitelist = self._whitelist() if self.consul_kv_whitelist else None
-                self.check(case, case_id, thehive, whitelist, pairs, pair_selection)
+                defender = self._defender() if actions_enabled else None
+                self.check(case, case_id, thehive, whitelist, defender, pairs, pair_selection)
             elif self.service == "update":
                 if not self.consul_kv_whitelist:
                     self._fail(thehive, case_id, "Consul KV whitelist key is missing")
                 self.update(case, case_id, thehive, self._whitelist(), pairs, pair_selection)
             else:
                 self._fail(thehive, case_id, f"Unknown service: {self.service}")
-        except (TheHiveError, ConsulKVError) as exc:
+        except (TheHiveError, ConsulKVError, DefenderActionError) as exc:
             self._fail(thehive, case_id, str(exc))
         except SystemExit:
             raise
@@ -119,7 +151,73 @@ class DCSyncWhitelistResponder(Responder):
             self._log_failure(thehive, case_id, f"unexpected error: {exc}")
             self.error(traceback.format_exc())
 
-    def check(self, case, case_id, thehive, whitelist, pairs, pair_selection):
+    def _containment_actions(self, defender, case, unmatched):
+        """Run the configured containment actions on the unmatched (non-whitelisted) pairs only.
+
+        Returns (actions, all_succeeded); all_succeeded is vacuously True when neither
+        disable_user_on_tp nor isolate_device_on_tp is enabled.
+        """
+        actions = []
+
+        if self.disable_user_on_tp:
+            users = {}
+            for pair in unmatched:
+                users.setdefault(
+                    pair["user_id"], {"display": pair["user"], "predicate": pair["user_id_predicate"]}
+                )
+            for user_id, info in users.items():
+                if info["predicate"] != "Account_Object_ID":
+                    actions.append(
+                        {
+                            "type": "disable_user",
+                            "target": info["display"],
+                            "id": user_id,
+                            "success": False,
+                            "detail": "no Entra account id available (only on-prem AD id resolved)",
+                        }
+                    )
+                    continue
+                try:
+                    defender.disable_user(user_id)
+                    actions.append(
+                        {"type": "disable_user", "target": info["display"], "id": user_id, "success": True, "detail": None}
+                    )
+                except DefenderActionError as exc:
+                    actions.append(
+                        {
+                            "type": "disable_user",
+                            "target": info["display"],
+                            "id": user_id,
+                            "success": False,
+                            "detail": str(exc),
+                        }
+                    )
+
+        if self.isolate_device_on_tp:
+            devices = {}
+            for pair in unmatched:
+                devices.setdefault(pair["device_id"], pair["host"])
+            comment = f"CySOC DCSync — TheHive case {case.get('caseId') or case.get('number')}"
+            for device_id, host in devices.items():
+                try:
+                    defender.isolate_device(device_id, comment, full=self.full_isolation)
+                    actions.append(
+                        {"type": "isolate_device", "target": host, "id": device_id, "success": True, "detail": None}
+                    )
+                except DefenderActionError as exc:
+                    actions.append(
+                        {
+                            "type": "isolate_device",
+                            "target": host,
+                            "id": device_id,
+                            "success": False,
+                            "detail": str(exc),
+                        }
+                    )
+
+        return actions, all(a["success"] for a in actions)
+
+    def check(self, case, case_id, thehive, whitelist, defender, pairs, pair_selection):
         entries = whitelist.entries() if whitelist else {}
         matched, unmatched = [], []
         for pair in pairs:
@@ -129,6 +227,7 @@ class DCSyncWhitelistResponder(Responder):
                 unmatched.append(pair)
 
         case_closed = False
+        actions = []
         if whitelist is None:
             verdict = "true-positive"
             log_message = (
@@ -137,12 +236,25 @@ class DCSyncWhitelistResponder(Responder):
             )
         elif unmatched:
             verdict = "true-positive"
-            log_message = (
-                f"{LOG_PREFIX['check']}: closed automatically as a true-positive — user+host pair(s) not "
-                "found in the whitelist: " + ", ".join(f"{p['user']}@{p['host']}" for p in unmatched)
+            base_message = "user+host pair(s) not found in the whitelist: " + ", ".join(
+                f"{p['user']}@{p['host']}" for p in unmatched
             )
-            thehive.close_case_true_positive(case_id)
-            case_closed = True
+            actions, all_succeeded = self._containment_actions(defender, case, unmatched)
+            action_summary = "; ".join(
+                f"{a['type']}: {a['target']} ({'success' if a['success'] else 'FAILED — ' + a['detail']})"
+                for a in actions
+            )
+            if all_succeeded:
+                thehive.close_case_true_positive(case_id)
+                case_closed = True
+                log_message = f"{LOG_PREFIX['check']}: closed automatically as a true-positive — {base_message}"
+            else:
+                log_message = (
+                    f"{LOG_PREFIX['check']}: true-positive, NOT closed — one or more containment actions "
+                    f"failed — {base_message}"
+                )
+            if action_summary:
+                log_message += "; " + action_summary
         else:
             verdict = "false-positive"
             whitelisted = ", ".join(f"{p['user']}@{p['host']}" for p in matched)
@@ -165,6 +277,7 @@ class DCSyncWhitelistResponder(Responder):
                 "pairs_evaluated": len(pairs),
                 "matched": matched,
                 "unmatched": unmatched,
+                "actions": actions,
                 "case_closed": case_closed,
             }
         )

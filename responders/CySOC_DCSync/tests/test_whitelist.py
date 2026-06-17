@@ -74,6 +74,16 @@ def test_resolve_pairs_from_reports():
     assert pairs[0]["host"] == "ws01.socdev.lan"
 
 
+def test_resolve_records_user_id_predicate_for_entra_id():
+    pairs, _, _ = PairResolver().resolve([host_obs(), user_obs()])
+    assert pairs[0]["user_id_predicate"] == "Account_Object_ID"
+
+
+def test_resolve_records_user_id_predicate_for_onprem_only_id():
+    pairs, _, _ = PairResolver().resolve([host_obs(), user_obs(predicate="OnPrem_Object_ID")])
+    assert pairs[0]["user_id_predicate"] == "OnPrem_Object_ID"
+
+
 def test_resolve_reports_observables_without_enrichment_as_unresolved():
     pairs, unresolved, _ = PairResolver().resolve([observable("hostname", "ghost"), user_obs()])
     assert pairs == []

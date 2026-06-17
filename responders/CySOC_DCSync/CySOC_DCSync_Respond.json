@@ -4,7 +4,7 @@
     "author": "CySOC",
     "url": "https://github.com/TheHive-Project/Cortex-Analyzers",
     "license": "AGPL-V3",
-    "description": "Evaluate a DCSync case against the user+host whitelist stored in Consul KV. Stable identifiers (Microsoft Defender device id, directory object id) are read from the MicrosoftDefender enrichment analyzer reports attached to the observables, so any spelling of the same user/host matches the same whitelist entry. All pairs whitelisted: closes the case as a false positive. Any pair not whitelisted: closes the case as a true positive. Fails without closing when an observable lacks enrichment. The decision is always logged to a 'CySOC/Log' task on the case.",
+    "description": "Evaluate a DCSync case against the user+host whitelist stored in Consul KV. Stable identifiers (Microsoft Defender device id, directory object id) are read from the MicrosoftDefender enrichment analyzer reports attached to the observables, so any spelling of the same user/host matches the same whitelist entry. All pairs whitelisted: closes the case as a false positive. Any pair not whitelisted: optionally disables the user's Entra account and/or isolates the source device (only the non-whitelisted user/device pairs), then closes the case as a true positive only if every attempted action succeeded — otherwise the case is left open. Fails without closing when an observable lacks enrichment. The decision is always logged to a 'CySOC/Log' task on the case.",
     "dataTypeList": [
         "thehive:case"
     ],
@@ -61,6 +61,54 @@
             "multi": false,
             "required": false,
             "defaultValue": true
+        },
+        {
+            "name": "tenant_id",
+            "description": "Azure AD tenant id. Required only if disable_user_on_tp or isolate_device_on_tp is enabled",
+            "type": "string",
+            "multi": false,
+            "required": false,
+            "defaultValue": ""
+        },
+        {
+            "name": "client_id",
+            "description": "Azure AD app registration (client) id, granted Microsoft Graph 'User.EnableDisableAccount.All' + 'User.Read.All' and a Defender for Endpoint machine-action permission (e.g. 'Machine.Isolate'). Required only if disable_user_on_tp or isolate_device_on_tp is enabled",
+            "type": "string",
+            "multi": false,
+            "required": false,
+            "defaultValue": ""
+        },
+        {
+            "name": "client_secret",
+            "description": "Client secret for the app registration above. Required only if disable_user_on_tp or isolate_device_on_tp is enabled",
+            "type": "string",
+            "multi": false,
+            "required": false,
+            "defaultValue": ""
+        },
+        {
+            "name": "disable_user_on_tp",
+            "description": "On true-positive, disable the Entra account of every non-whitelisted user via Microsoft Graph",
+            "type": "boolean",
+            "multi": false,
+            "required": false,
+            "defaultValue": false
+        },
+        {
+            "name": "isolate_device_on_tp",
+            "description": "On true-positive, isolate every non-whitelisted source device via Microsoft Defender for Endpoint",
+            "type": "boolean",
+            "multi": false,
+            "required": false,
+            "defaultValue": false
+        },
+        {
+            "name": "full_isolation",
+            "description": "Isolation scope for isolate_device_on_tp: false (default, recommended) isolates Selectively; true performs a Full network isolation. Ignored unless isolate_device_on_tp is enabled",
+            "type": "boolean",
+            "multi": false,
+            "required": false,
+            "defaultValue": false
         }
     ]
 }

@@ -144,7 +144,10 @@ class PairResolver:
     def resolve(self, observables: list) -> tuple:
         """Return (pairs, unresolved, selection).
 
-        pairs:      [{"key", "user", "user_id", "host", "device_id"}] — user×host combinations
+        pairs:      [{"key", "user", "user_id", "user_id_predicate", "host", "device_id"}]
+                    — user×host combinations. "user_id_predicate" records which taxonomy
+                    matched the user id (e.g. "Account_Object_ID" vs "OnPrem_Object_ID"),
+                    since only the former is a Microsoft Graph-recognized id.
         unresolved: [{"data", "dataType", "reason"}] — selected candidates without a canonical id
         selection:  "source-role-tags" when role tags narrowed any group, else "all-candidates"
         """
@@ -159,6 +162,7 @@ class PairResolver:
                 "key": pair_key(user["id"], host["id"]),
                 "user": user["data"],
                 "user_id": user["id"],
+                "user_id_predicate": user["id_predicate"],
                 "host": host["data"],
                 "device_id": host["id"],
             }
@@ -173,11 +177,11 @@ class PairResolver:
         seen_ids = set()
         for obs in candidates:
             data = (obs.get("data") or "").strip()
-            canonical = taxonomy_value(obs, predicates)
+            matched_predicate, canonical = self._first_taxonomy_match(obs, predicates)
             if canonical:
                 if canonical.lower() not in seen_ids:
                     seen_ids.add(canonical.lower())
-                    resolved.append({"data": data, "id": canonical})
+                    resolved.append({"data": data, "id": canonical, "id_predicate": matched_predicate})
             else:
                 unresolved.append(
                     {
@@ -187,3 +191,12 @@ class PairResolver:
                     }
                 )
         return resolved
+
+    @staticmethod
+    def _first_taxonomy_match(observable: dict, predicates: tuple) -> tuple:
+        """Like taxonomy_value, but also returns which predicate matched (priority order)."""
+        for predicate in predicates:
+            value = taxonomy_value(observable, (predicate,))
+            if value:
+                return predicate, value
+        return None, None

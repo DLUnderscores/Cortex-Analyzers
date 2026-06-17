@@ -3,11 +3,15 @@ import json
 import pytest
 
 from dcsync_whitelist import DCSyncWhitelistResponder
+from defender_client import DefenderActionError
 from whitelist import pair_key
 
 USER_GUID = "11111111-2222-3333-4444-555555555555"
 DEVICE_ID = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
 PAIR_KEY = pair_key(USER_GUID, DEVICE_ID)
+USER1_GUID = "22222222-2222-2222-2222-222222222222"
+USER2_GUID = "33333333-3333-3333-3333-333333333333"
+LAB1_DEVICE_ID = "b" * 40
 
 CASE = {
     "_id": "~4128",
@@ -68,10 +72,29 @@ class StubWhitelist:
         self.stored[key] = metadata
 
 
+class StubDefender:
+    def __init__(self, fail_users=(), fail_devices=()):
+        self.disabled = []
+        self.isolated = []  # (device_id, full)
+        self.fail_users = set(fail_users)
+        self.fail_devices = set(fail_devices)
+
+    def disable_user(self, user_id):
+        if user_id in self.fail_users:
+            raise DefenderActionError(f"failed to disable {user_id}")
+        self.disabled.append(user_id)
+
+    def isolate_device(self, device_id, comment, full=False):
+        if device_id in self.fail_devices:
+            raise DefenderActionError(f"failed to isolate {device_id}")
+        self.isolated.append((device_id, full))
+
+
 class ResponderUnderTest(DCSyncWhitelistResponder):
-    def __init__(self, job_directory, thehive, whitelist):
+    def __init__(self, job_directory, thehive, whitelist, defender=None):
         self.stub_thehive = thehive
         self.stub_whitelist = whitelist
+        self.stub_defender = defender
         super().__init__(job_directory=str(job_directory))
 
     def _thehive(self):
@@ -79,6 +102,9 @@ class ResponderUnderTest(DCSyncWhitelistResponder):
 
     def _whitelist(self):
         return self.stub_whitelist
+
+    def _defender(self):
+        return self.stub_defender
 
 
 def write_job(tmp_path, service, case=CASE, config_overrides=None):
@@ -101,10 +127,37 @@ def read_output(tmp_path):
     return json.loads((tmp_path / "output" / "output.json").read_text())
 
 
-def run_responder(tmp_path, thehive, whitelist):
-    responder = ResponderUnderTest(tmp_path, thehive, whitelist)
+def run_responder(tmp_path, thehive, whitelist, defender=None):
+    responder = ResponderUnderTest(tmp_path, thehive, whitelist, defender)
     responder.run()
     return read_output(tmp_path)
+
+
+def two_user_one_host_observables():
+    """user1@lab1 and user2@lab1 — used to test that only the non-whitelisted pair is acted on."""
+    host = {
+        "dataType": "hostname",
+        "data": "lab1",
+        "tags": [],
+        "reports": {"MicrosoftDefender_GetDeviceInfo_1_0": {"taxonomies": [{"predicate": "Device_ID", "value": LAB1_DEVICE_ID}]}},
+    }
+    user1 = {
+        "dataType": "username",
+        "data": "user1",
+        "tags": [],
+        "reports": {
+            "MicrosoftDefender_GetUserInfo_1_0": {"taxonomies": [{"predicate": "Account_Object_ID", "value": USER1_GUID}]}
+        },
+    }
+    user2 = {
+        "dataType": "username",
+        "data": "user2",
+        "tags": [],
+        "reports": {
+            "MicrosoftDefender_GetUserInfo_1_0": {"taxonomies": [{"predicate": "Account_Object_ID", "value": USER2_GUID}]}
+        },
+    }
+    return [host, user1, user2]
 
 
 def test_check_all_pairs_whitelisted_closes_case_as_fp(tmp_path):
@@ -214,6 +267,92 @@ def test_unexpected_error_is_logged_to_task(tmp_path):
     assert output["success"] is False
     assert "FAILED" in thehive.logs[0][3]
     assert "boom" in thehive.logs[0][3]
+
+
+def test_check_containment_actions_only_target_non_whitelisted_pair(tmp_path):
+    write_job(
+        tmp_path,
+        "check",
+        config_overrides={
+            "disable_user_on_tp": True,
+            "isolate_device_on_tp": True,
+            "tenant_id": "t",
+            "client_id": "c",
+            "client_secret": "s",
+        },
+    )
+    thehive = StubTheHive(two_user_one_host_observables())
+    whitelist = StubWhitelist({pair_key(USER1_GUID, LAB1_DEVICE_ID): {"account": "user1"}})
+    defender = StubDefender()
+
+    output = run_responder(tmp_path, thehive, whitelist, defender)
+
+    assert output["full"]["verdict"] == "true-positive"
+    assert output["full"]["case_closed"] is True
+    assert defender.disabled == [USER2_GUID]
+    assert defender.isolated == [(LAB1_DEVICE_ID, False)]
+    assert thehive.closed[0] == ("~4128", "true-positive")
+
+
+def test_check_case_not_closed_when_an_action_fails(tmp_path):
+    write_job(
+        tmp_path,
+        "check",
+        config_overrides={"disable_user_on_tp": True, "tenant_id": "t", "client_id": "c", "client_secret": "s"},
+    )
+    thehive = StubTheHive(two_user_one_host_observables())
+    whitelist = StubWhitelist({pair_key(USER1_GUID, LAB1_DEVICE_ID): {"account": "user1"}})
+    defender = StubDefender(fail_users=[USER2_GUID])
+
+    output = run_responder(tmp_path, thehive, whitelist, defender)
+
+    assert output["full"]["verdict"] == "true-positive"
+    assert output["full"]["case_closed"] is False
+    assert thehive.closed == []
+    assert "NOT closed" in thehive.logs[0][3]
+    assert "FAILED" in thehive.logs[0][3]
+
+
+def test_check_disable_user_skipped_for_onprem_only_id(tmp_path):
+    write_job(
+        tmp_path,
+        "check",
+        config_overrides={"disable_user_on_tp": True, "tenant_id": "t", "client_id": "c", "client_secret": "s"},
+    )
+    observables = [
+        OBSERVABLES[0],
+        {
+            "dataType": "username",
+            "data": "svc-sync",
+            "tags": [],
+            "reports": {
+                "MicrosoftDefender_GetUserInfo_1_0": {
+                    "taxonomies": [{"predicate": "OnPrem_Object_ID", "value": USER_GUID}]
+                }
+            },
+        },
+    ]
+    thehive = StubTheHive(observables)
+    defender = StubDefender()
+
+    output = run_responder(tmp_path, thehive, StubWhitelist(), defender)
+
+    assert output["full"]["case_closed"] is False
+    assert defender.disabled == []
+    assert output["full"]["actions"][0]["success"] is False
+    assert "on-prem" in output["full"]["actions"][0]["detail"]
+
+
+def test_check_requires_defender_credentials_when_action_enabled(tmp_path):
+    write_job(tmp_path, "check", config_overrides={"disable_user_on_tp": True})
+    thehive = StubTheHive(OBSERVABLES)
+
+    with pytest.raises(SystemExit):
+        run_responder(tmp_path, thehive, StubWhitelist())
+
+    output = read_output(tmp_path)
+    assert output["success"] is False
+    assert "tenant_id" in output["errorMessage"]
 
 
 def test_check_fails_safe_when_no_pair_found(tmp_path):
