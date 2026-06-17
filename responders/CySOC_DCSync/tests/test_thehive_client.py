@@ -16,7 +16,7 @@ def query_router(**responses):
     return _route
 
 
-def test_close_case_false_positive_reopens_then_resolves(fake_http):
+def test_close_case_false_positive_sends_two_patches_in_order(fake_http):
     fake_http.route("PATCH", f"/api/case/{CASE_ID}", FakeResponse(200, {}))
     client = TheHiveClient("http://thehive", "key", http=fake_http)
 
@@ -24,28 +24,35 @@ def test_close_case_false_positive_reopens_then_resolves(fake_http):
 
     patch_calls = [c for c in fake_http.calls if c["method"] == "PATCH"]
     assert len(patch_calls) == 2
-    assert patch_calls[0]["json"] == {"status": "Open"}
+    # First PATCH closes/keeps-closed — no verdict fields yet
+    assert patch_calls[0]["json"] == {"status": "Resolved"}
+    # Second PATCH sets verdict without "status" so closeCase is not prepended server-side
     fp_body = patch_calls[1]["json"]
+    assert "status" not in fp_body
     assert "summary" not in fp_body
-    assert fp_body == {"status": "Resolved", "resolutionStatus": "FalsePositive", "impactStatus": "NotApplicable"}
+    assert fp_body == {"resolutionStatus": "FalsePositive", "impactStatus": "NotApplicable"}
 
 
-def test_close_case_false_positive_succeeds_even_if_reopen_fails(fake_http):
+def test_close_case_false_positive_raises_if_first_patch_fails(fake_http):
+    fake_http.route("PATCH", f"/api/case/{CASE_ID}", FakeResponse(500, text="server error"))
+    client = TheHiveClient("http://thehive", "key", http=fake_http)
+
+    with pytest.raises(TheHiveError):
+        client.close_case_false_positive(CASE_ID)
+
+
+def test_close_case_false_positive_raises_if_second_patch_fails(fake_http):
     call_count = {"n": 0}
 
     def patch_response(**kwargs):
         call_count["n"] += 1
-        if call_count["n"] == 1:
-            return FakeResponse(400, text="already open")
-        return FakeResponse(200, {})
+        return FakeResponse(200, {}) if call_count["n"] == 1 else FakeResponse(500, text="server error")
 
     fake_http.route("PATCH", f"/api/case/{CASE_ID}", patch_response)
     client = TheHiveClient("http://thehive", "key", http=fake_http)
 
-    client.close_case_false_positive(CASE_ID)  # must not raise
-
-    fp_body = fake_http.calls[-1]["json"]
-    assert fp_body["resolutionStatus"] == "FalsePositive"
+    with pytest.raises(TheHiveError):
+        client.close_case_false_positive(CASE_ID)
 
 
 def test_close_case_true_positive_never_touches_summary(fake_http):

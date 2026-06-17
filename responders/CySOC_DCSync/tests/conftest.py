@@ -1,10 +1,62 @@
 import json
 import sys
+import types
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+# Stub cortexutils so tests run without the nix dev shell.
+if "cortexutils" not in sys.modules:
+    import os
+
+    _cx = types.ModuleType("cortexutils")
+    _cx_resp = types.ModuleType("cortexutils.responder")
+
+    class _Responder:
+        def __init__(self, job_directory=None):
+            self._job_dir = job_directory
+            self._job = {}
+            if job_directory:
+                input_path = os.path.join(job_directory, "input", "input.json")
+                if os.path.isfile(input_path):
+                    with open(input_path) as f:
+                        self._job = json.load(f)
+
+        def get_param(self, name, default=None, message=None):
+            parts = name.split(".")
+            obj = self._job
+            for part in parts:
+                if not isinstance(obj, dict):
+                    return default
+                obj = obj.get(part)
+                if obj is None:
+                    return default
+            return obj if obj is not None else default
+
+        def get_data(self):
+            return self._job.get("data", {})
+
+        def error(self, msg):
+            if self._job_dir:
+                out_dir = os.path.join(self._job_dir, "output")
+                os.makedirs(out_dir, exist_ok=True)
+                with open(os.path.join(out_dir, "output.json"), "w") as f:
+                    json.dump({"success": False, "errorMessage": msg}, f)
+            raise SystemExit(msg)
+
+        def report(self, data):
+            if self._job_dir:
+                out_dir = os.path.join(self._job_dir, "output")
+                os.makedirs(out_dir, exist_ok=True)
+                with open(os.path.join(out_dir, "output.json"), "w") as f:
+                    json.dump({"success": True, "full": data}, f)
+
+    _cx_resp.Responder = _Responder
+    _cx.responder = _cx_resp
+    sys.modules["cortexutils"] = _cx
+    sys.modules["cortexutils.responder"] = _cx_resp
 
 
 class FakeResponse:

@@ -46,31 +46,25 @@ class TheHiveClient:
         # No "summary" field here — the case Summary is analyst-owned; the decision is logged
         # to the Log task instead (see DCSyncWhitelistResponder._log).
         #
-        # Reopen first (best-effort, errors ignored): TheHive v4 does not update resolutionStatus
-        # when status is already "Resolved", so re-closing a case that was previously closed with
-        # a different verdict (e.g. TruePositive → FalsePositive) requires transitioning through
-        # Open first.
-        self.http.patch(
-            f"{self.url}/api/case/{case_id}",
-            headers=self.headers,
-            json={"status": "Open"},
-            verify=self.verify,
-            timeout=30,
-        )
-        body = {
-            "status": "Resolved",
-            "resolutionStatus": "FalsePositive",
-            "impactStatus": "NotApplicable",
-        }
-        resp = self.http.patch(
-            f"{self.url}/api/case/{case_id}",
-            headers=self.headers,
-            json=body,
-            verify=self.verify,
-            timeout=30,
-        )
-        if not (200 <= resp.status_code < 300):
-            raise TheHiveError(f"Failed to close case {case_id}: HTTP {resp.status_code} — {resp.text}")
+        # Two-PATCH approach: first close/keep-closed with {status: "Resolved"}, then set the
+        # verdict with {resolutionStatus, impactStatus} in a separate request. Splitting the two
+        # steps ensures that setResolutionStatus runs in its own transaction without CaseSrv's
+        # closeCase PropertyUpdater prepended — which only triggers when "status": "Resolved" is
+        # present in the body. This makes the verdict update work regardless of whether the case
+        # was already Resolved (e.g. previously closed as TruePositive).
+        for body in (
+            {"status": "Resolved"},
+            {"resolutionStatus": "FalsePositive", "impactStatus": "NotApplicable"},
+        ):
+            resp = self.http.patch(
+                f"{self.url}/api/case/{case_id}",
+                headers=self.headers,
+                json=body,
+                verify=self.verify,
+                timeout=30,
+            )
+            if not (200 <= resp.status_code < 300):
+                raise TheHiveError(f"Failed to close case {case_id} as FalsePositive: HTTP {resp.status_code} — {resp.text}")
 
     def close_case_true_positive(self, case_id: str) -> None:
         body = {
