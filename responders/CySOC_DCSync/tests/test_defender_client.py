@@ -6,6 +6,8 @@ from defender_client import DefenderActionError, DefenderClient
 TENANT_ID = "11111111-1111-1111-1111-111111111111"
 USER_ID = "a11133f3-9f15-4294-b779-600f5cbce391"
 DEVICE_ID = "d5735271e432abf076c0a009fe1eae3aaffd51e4"
+IDENTITY_ACCOUNT_ID = "c86844d7-5270-4bac-b5c4-d9174d11a9e2"
+ONPREM_ID = "5c8dcfd2-d4f1-45c7-b28f-68076378e4f8"
 
 
 def token_route(fake_http, token="tok"):
@@ -83,24 +85,54 @@ def test_token_is_cached_per_scope(fake_http):
     assert token_calls["count"] == 1
 
 
-def test_force_password_reset_success(fake_http):
+def test_force_password_reset_entra_success(fake_http):
     token_route(fake_http)
     fake_http.route("PATCH", f"/users/{USER_ID}", FakeResponse(200, {}))
     client = DefenderClient(TENANT_ID, "client", "secret", http=fake_http)
 
-    client.force_password_reset(USER_ID)
+    client.force_password_reset_entra(USER_ID)
 
     call = fake_http.calls[-1]
     assert call["json"] == {"passwordProfile": {"forceChangePasswordNextSignIn": True}}
 
 
-def test_force_password_reset_raises_on_error(fake_http):
+def test_force_password_reset_entra_raises_on_error(fake_http):
     token_route(fake_http)
     fake_http.route("PATCH", f"/users/{USER_ID}", FakeResponse(403, text="forbidden"))
     client = DefenderClient(TENANT_ID, "client", "secret", http=fake_http)
 
     with pytest.raises(DefenderActionError):
-        client.force_password_reset(USER_ID)
+        client.force_password_reset_entra(USER_ID)
+
+
+def test_force_password_reset_ad_success(fake_http):
+    token_route(fake_http)
+    fake_http.route(
+        "POST", f"/security/identities/identityAccounts/{IDENTITY_ACCOUNT_ID}/invokeAction", FakeResponse(200, {})
+    )
+    client = DefenderClient(TENANT_ID, "client", "secret", http=fake_http)
+
+    client.force_password_reset_ad(IDENTITY_ACCOUNT_ID, ONPREM_ID)
+
+    call = fake_http.calls[-1]
+    assert f"/security/identities/identityAccounts/{IDENTITY_ACCOUNT_ID}/invokeAction" in call["url"]
+    assert call["json"] == {
+        "accountId": ONPREM_ID,
+        "action": "forcePasswordReset",
+        "identityProvider": "activeDirectory",
+    }
+    assert call["headers"]["Authorization"] == "Bearer tok"
+
+
+def test_force_password_reset_ad_raises_on_error(fake_http):
+    token_route(fake_http)
+    fake_http.route(
+        "POST", f"/security/identities/identityAccounts/{IDENTITY_ACCOUNT_ID}/invokeAction", FakeResponse(403, text="forbidden")
+    )
+    client = DefenderClient(TENANT_ID, "client", "secret", http=fake_http)
+
+    with pytest.raises(DefenderActionError):
+        client.force_password_reset_ad(IDENTITY_ACCOUNT_ID, ONPREM_ID)
 
 
 def test_revoke_sessions_success(fake_http):

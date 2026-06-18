@@ -59,7 +59,12 @@ class DefenderClient:
         if not (200 <= resp.status_code < 300):
             raise DefenderActionError(f"Failed to disable user {user_id}: HTTP {resp.status_code} — {resp.text}")
 
-    def force_password_reset(self, user_id: str) -> None:
+    def force_password_reset_entra(self, user_id: str) -> None:
+        """Force a password change at next sign-in for a cloud-only Entra user (Graph passwordProfile).
+
+        Ineffective for hybrid identities whose password is mastered on-prem — use
+        force_password_reset_ad for those (see the identityAccounts invokeAction endpoint).
+        """
         resp = self.http.patch(
             f"{GRAPH_BASE_URL}/users/{user_id}",
             headers={"Authorization": f"Bearer {self._token(GRAPH_SCOPE)}", "Content-Type": "application/json"},
@@ -69,6 +74,25 @@ class DefenderClient:
         if not (200 <= resp.status_code < 300):
             raise DefenderActionError(
                 f"Failed to force password reset for user {user_id}: HTTP {resp.status_code} — {resp.text}"
+            )
+
+    def force_password_reset_ad(self, identity_account_id: str, account_id: str) -> None:
+        """Force a password reset on an on-prem AD account via the Defender identityAccounts action.
+
+        identity_account_id is the Defender identity-account GUID (path id); account_id is the on-prem
+        AD object id (the analyzer's OnPrem_Object_ID). forcePasswordReset only supports the
+        activeDirectory provider, so this is the path that works for hybrid/on-prem identities.
+        Requires the SecurityIdentitiesActions.ReadWrite.All application permission.
+        """
+        resp = self.http.post(
+            f"{GRAPH_BASE_URL}/security/identities/identityAccounts/{identity_account_id}/invokeAction",
+            headers={"Authorization": f"Bearer {self._token(GRAPH_SCOPE)}", "Content-Type": "application/json"},
+            json={"accountId": account_id, "action": "forcePasswordReset", "identityProvider": "activeDirectory"},
+            timeout=30,
+        )
+        if not (200 <= resp.status_code < 300):
+            raise DefenderActionError(
+                f"Failed to force AD password reset for account {account_id}: HTTP {resp.status_code} — {resp.text}"
             )
 
     def revoke_sessions(self, user_id: str) -> None:

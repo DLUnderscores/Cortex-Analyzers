@@ -168,10 +168,23 @@ class DCSyncWhitelistResponder(Responder):
 
     @staticmethod
     def _unique_users(unmatched):
-        """Deduplicate users from unmatched pairs, preserving first-occurrence order."""
+        """Deduplicate users from unmatched pairs, preserving first-occurrence order.
+
+        Each entry carries the canonical id predicate plus the individual ids (any may be None),
+        so containment can pick the right action per identity type.
+        """
         seen = {}
         for pair in unmatched:
-            seen.setdefault(pair["user_id"], {"display": pair["user"], "predicate": pair["user_id_predicate"]})
+            seen.setdefault(
+                pair["user_id"],
+                {
+                    "display": pair["user"],
+                    "predicate": pair["user_id_predicate"],
+                    "entra_object_id": pair.get("entra_object_id"),
+                    "onprem_object_id": pair.get("onprem_object_id"),
+                    "identity_account_id": pair.get("identity_account_id"),
+                },
+            )
         return seen
 
     @staticmethod
@@ -207,6 +220,54 @@ class DCSyncWhitelistResponder(Responder):
                 )
         return results
 
+    @staticmethod
+    def _run_force_password_reset(defender, users):
+        """Force a password reset per unique user, choosing the path that actually works.
+
+        On-prem/hybrid accounts (identity-account id + on-prem AD id available) go through the
+        Defender identityAccounts invokeAction endpoint (the only path that resets an on-prem-mastered
+        password); cloud-only Entra accounts fall back to the Graph passwordProfile patch. A user with
+        neither usable id pair can't be reset and is recorded as a failure.
+        """
+        results = []
+        for info in users.values():
+            target = info["display"]
+            identity_account_id = info.get("identity_account_id")
+            onprem_object_id = info.get("onprem_object_id")
+            entra_object_id = info.get("entra_object_id")
+            if identity_account_id and onprem_object_id:
+                method, action_id = "AD", onprem_object_id
+            elif entra_object_id:
+                method, action_id = "Entra", entra_object_id
+            else:
+                results.append(
+                    {
+                        "type": "force_password_reset",
+                        "target": target,
+                        "id": onprem_object_id or entra_object_id or "",
+                        "success": False,
+                        "method": None,
+                        "detail": "no AD identity-account id or Entra id available — "
+                        "run the MicrosoftDefender user analyzer first",
+                    }
+                )
+                continue
+            try:
+                if method == "AD":
+                    defender.force_password_reset_ad(identity_account_id, onprem_object_id)
+                else:
+                    defender.force_password_reset_entra(entra_object_id)
+                results.append(
+                    {"type": "force_password_reset", "target": target, "id": action_id, "success": True,
+                     "method": method, "detail": None}
+                )
+            except DefenderActionError as exc:
+                results.append(
+                    {"type": "force_password_reset", "target": target, "id": action_id, "success": False,
+                     "method": method, "detail": str(exc)}
+                )
+        return results
+
     def _containment_actions(self, defender, case, unmatched):
         """Run the configured containment actions on the unmatched (non-whitelisted) pairs only.
 
@@ -221,7 +282,7 @@ class DCSyncWhitelistResponder(Responder):
             if self.disable_user_on_tp:
                 actions.extend(self._try_graph_action("disable_user", users, defender.disable_user))
             if self.force_password_reset_on_tp:
-                actions.extend(self._try_graph_action("force_password_reset", users, defender.force_password_reset))
+                actions.extend(self._run_force_password_reset(defender, users))
             if self.revoke_sessions_on_tp:
                 actions.extend(self._try_graph_action("revoke_sessions", users, defender.revoke_sessions))
 
@@ -271,10 +332,14 @@ class DCSyncWhitelistResponder(Responder):
                 f"{prefix}: FAILED to disable account in Entra — {tgt} ({uid}): {detail}"
             )
         elif t == "force_password_reset":
+            # method is "Entra" (cloud-only Graph patch), "AD" (on-prem/hybrid invokeAction), or
+            # None when no usable id was available to attempt a reset at all.
+            method = action.get("method")
+            where = f" in {method}" if method else ""
             msg = (
-                f"{prefix}: password reset forced in Entra — {tgt} ({uid})"
+                f"{prefix}: password reset forced{where} — {tgt} ({uid})"
                 if ok else
-                f"{prefix}: FAILED to force password reset in Entra — {tgt} ({uid}): {detail}"
+                f"{prefix}: FAILED to force password reset{where} — {tgt} ({uid}): {detail}"
             )
         elif t == "revoke_sessions":
             msg = (

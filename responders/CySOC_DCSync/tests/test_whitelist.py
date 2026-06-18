@@ -26,8 +26,11 @@ def host_obs(data="ws01.socdev.lan", device_id=DEVICE_ID, tags=()):
     return observable("hostname", data, tags=tags, reports=reports)
 
 
-def user_obs(data="svc-sync", user_id=USER_GUID, predicate="Account_Object_ID", tags=()):
-    reports = {"MicrosoftDefender_GetUserInfo_1_0": {"taxonomies": [{"predicate": predicate, "value": user_id}]}}
+def user_obs(data="svc-sync", user_id=USER_GUID, predicate="Account_Object_ID", tags=(), extra=None):
+    taxonomies = [{"predicate": predicate, "value": user_id}]
+    for extra_predicate, extra_value in (extra or {}).items():
+        taxonomies.append({"predicate": extra_predicate, "value": extra_value})
+    reports = {"MicrosoftDefender_GetUserInfo_1_0": {"taxonomies": taxonomies}}
     return observable("username", data, tags=tags, reports=reports)
 
 
@@ -82,6 +85,23 @@ def test_resolve_records_user_id_predicate_for_entra_id():
 def test_resolve_records_user_id_predicate_for_onprem_only_id():
     pairs, _, _ = PairResolver().resolve([host_obs(), user_obs(predicate="OnPrem_Object_ID")])
     assert pairs[0]["user_id_predicate"] == "OnPrem_Object_ID"
+
+
+def test_resolve_carries_supplementary_user_ids():
+    user = user_obs(
+        extra={"OnPrem_Object_ID": "onprem-guid", "Identity_Account_ID": "identity-account-guid"}
+    )
+    pairs, _, _ = PairResolver().resolve([host_obs(), user])
+    assert pairs[0]["entra_object_id"] == USER_GUID
+    assert pairs[0]["onprem_object_id"] == "onprem-guid"
+    assert pairs[0]["identity_account_id"] == "identity-account-guid"
+
+
+def test_resolve_supplementary_ids_default_to_none_when_absent():
+    pairs, _, _ = PairResolver().resolve([host_obs(), user_obs()])
+    assert pairs[0]["entra_object_id"] == USER_GUID
+    assert pairs[0]["onprem_object_id"] is None
+    assert pairs[0]["identity_account_id"] is None
 
 
 def test_resolve_reports_observables_without_enrichment_as_unresolved():

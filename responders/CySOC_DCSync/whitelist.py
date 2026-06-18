@@ -29,6 +29,11 @@ USER_DATA_TYPES = ("username",)
 # Taxonomy predicates produced by the MicrosoftDefender enrichment analyzers
 DEVICE_ID_PREDICATES = ("Device_ID",)
 USER_ID_PREDICATES = ("Account_Object_ID", "OnPrem_Object_ID")
+# Supplementary user ids carried alongside the canonical user id, so containment can pick the right
+# Graph/Defender action per identity type (Entra cloud-only vs on-prem/hybrid AD password reset).
+ENTRA_OBJECT_ID_PREDICATES = ("Account_Object_ID",)
+ONPREM_OBJECT_ID_PREDICATES = ("OnPrem_Object_ID",)
+IDENTITY_ACCOUNT_ID_PREDICATES = ("Identity_Account_ID",)
 
 # Observables created by enrichment analyzers carry this tag; they are
 # by-products of the investigation, not the DCSync source host/account.
@@ -144,10 +149,13 @@ class PairResolver:
     def resolve(self, observables: list) -> tuple:
         """Return (pairs, unresolved, selection).
 
-        pairs:      [{"key", "user", "user_id", "user_id_predicate", "host", "device_id"}]
+        pairs:      [{"key", "user", "user_id", "user_id_predicate", "entra_object_id",
+                    "onprem_object_id", "identity_account_id", "host", "device_id"}]
                     — user×host combinations. "user_id_predicate" records which taxonomy
-                    matched the user id (e.g. "Account_Object_ID" vs "OnPrem_Object_ID"),
-                    since only the former is a Microsoft Graph-recognized id.
+                    matched the canonical user id (e.g. "Account_Object_ID" vs "OnPrem_Object_ID"),
+                    since only the former is a Microsoft Graph-recognized id. The three id fields
+                    carry the individual ids (any may be None) so containment can pick the right
+                    action per identity type — Entra cloud-only vs on-prem/hybrid AD reset.
         unresolved: [{"data", "dataType", "reason"}] — selected candidates without a canonical id
         selection:  "source-role-tags" when role tags narrowed any group, else "all-candidates"
         """
@@ -155,7 +163,16 @@ class PairResolver:
         host_candidates, hosts_by_role = select_source_candidates(select_candidates(observables, HOST_DATA_TYPES))
         user_candidates, users_by_role = select_source_candidates(select_candidates(observables, USER_DATA_TYPES))
         hosts = self._resolve_candidates(host_candidates, DEVICE_ID_PREDICATES, unresolved)
-        users = self._resolve_candidates(user_candidates, USER_ID_PREDICATES, unresolved)
+        users = self._resolve_candidates(
+            user_candidates,
+            USER_ID_PREDICATES,
+            unresolved,
+            extra_ids={
+                "entra_object_id": ENTRA_OBJECT_ID_PREDICATES,
+                "onprem_object_id": ONPREM_OBJECT_ID_PREDICATES,
+                "identity_account_id": IDENTITY_ACCOUNT_ID_PREDICATES,
+            },
+        )
 
         pairs = [
             {
@@ -163,6 +180,9 @@ class PairResolver:
                 "user": user["data"],
                 "user_id": user["id"],
                 "user_id_predicate": user["id_predicate"],
+                "entra_object_id": user.get("entra_object_id"),
+                "onprem_object_id": user.get("onprem_object_id"),
+                "identity_account_id": user.get("identity_account_id"),
                 "host": host["data"],
                 "device_id": host["id"],
             }
@@ -172,7 +192,7 @@ class PairResolver:
         selection = "source-role-tags" if (hosts_by_role or users_by_role) else "all-candidates"
         return pairs, unresolved, selection
 
-    def _resolve_candidates(self, candidates: list, predicates: tuple, unresolved: list) -> list:
+    def _resolve_candidates(self, candidates: list, predicates: tuple, unresolved: list, extra_ids: dict = None) -> list:
         resolved = []
         seen_ids = set()
         for obs in candidates:
@@ -181,7 +201,10 @@ class PairResolver:
             if canonical:
                 if canonical.lower() not in seen_ids:
                     seen_ids.add(canonical.lower())
-                    resolved.append({"data": data, "id": canonical, "id_predicate": matched_predicate})
+                    entry = {"data": data, "id": canonical, "id_predicate": matched_predicate}
+                    for field, field_predicates in (extra_ids or {}).items():
+                        entry[field] = taxonomy_value(obs, field_predicates)
+                    resolved.append(entry)
             else:
                 unresolved.append(
                     {

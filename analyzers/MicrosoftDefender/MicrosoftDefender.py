@@ -317,6 +317,13 @@ class MicrosoftDefenderAnalyzer(Analyzer):
             add("Account_Domain", user.get("AccountDomain"))
             add("Account_Object_ID", user.get("AccountObjectId"))
             add("OnPrem_Object_ID", user.get("OnPremObjectId"))
+            # Defender identity-account id — the trailing GUID of IdentityId (User_<tenant>_<id>).
+            # This is the path id required by the identityAccounts invokeAction endpoint, used by the
+            # DCSync responder to force a password reset on hybrid/on-prem-mastered accounts.
+            identity_id = user.get("IdentityId", "") or ""
+            id_tail = identity_id.rsplit("_", 1)[-1] if "_" in identity_id else ""
+            if GUID_RE.match(id_tail):
+                add("Identity_Account_ID", id_tail)
             add("Department", user.get("Department"))
             add("Job_Title", user.get("JobTitle"))
 
