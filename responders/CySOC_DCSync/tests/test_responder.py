@@ -78,7 +78,8 @@ class StubWhitelist:
 
 class StubDefender:
     def __init__(self, fail_users=(), fail_devices=()):
-        self.disabled = []
+        self.disabled = []  # Entra (cloud-only) disables, by user id
+        self.disabled_ad = []  # AD/hybrid disables, as (identity_account_id, account_id)
         self.password_resets = []  # Entra (cloud-only) resets, by user id
         self.password_resets_ad = []  # AD/hybrid resets, as (identity_account_id, account_id)
         self.revoked = []
@@ -86,10 +87,15 @@ class StubDefender:
         self.fail_users = set(fail_users)
         self.fail_devices = set(fail_devices)
 
-    def disable_user(self, user_id):
+    def disable_user_entra(self, user_id):
         if user_id in self.fail_users:
             raise DefenderActionError(f"failed to disable {user_id}")
         self.disabled.append(user_id)
+
+    def disable_user_ad(self, identity_account_id, account_id):
+        if account_id in self.fail_users or identity_account_id in self.fail_users:
+            raise DefenderActionError(f"failed to disable AD account {account_id}")
+        self.disabled_ad.append((identity_account_id, account_id))
 
     def force_password_reset_entra(self, user_id):
         if user_id in self.fail_users:
@@ -382,18 +388,19 @@ def test_check_graph_actions_skipped_for_onprem_only_id(tmp_path):
 
     assert output["full"]["case_closed"] is False
     assert defender.disabled == []
+    assert defender.disabled_ad == []
     assert defender.password_resets == []
     assert defender.password_resets_ad == []
     assert defender.revoked == []
     # all three actions should be recorded as failures (one per action type)
     failed = {a["type"]: a for a in output["full"]["actions"] if not a["success"]}
     assert set(failed) == {"disable_user", "force_password_reset", "revoke_sessions"}
-    # disable/revoke need an Entra id; password reset needs an AD identity-account id (or Entra)
-    assert "on-prem" in failed["disable_user"]["detail"]
-    assert "on-prem" in failed["revoke_sessions"]["detail"]
+    # disable/reset need an AD identity-account id (or Entra id); revoke needs an Entra id (Graph-only)
+    assert "identity-account" in failed["disable_user"]["detail"]
     assert "identity-account" in failed["force_password_reset"]["detail"]
+    assert "on-prem" in failed["revoke_sessions"]["detail"]
     log_messages = [entry[3] for entry in thehive.logs]
-    assert any("FAILED to disable account in Entra" in m for m in log_messages)
+    assert any("FAILED to disable account —" in m for m in log_messages)
     assert any("FAILED to force password reset —" in m for m in log_messages)
     assert any("FAILED to revoke sign-in sessions in Entra" in m for m in log_messages)
     assert any("NOT closed" in m for m in log_messages)
@@ -436,20 +443,9 @@ def test_check_requires_defender_credentials_when_action_enabled(tmp_path):
     assert "Azure tenant ID" in output["errorMessage"]
 
 
-def test_check_force_password_reset_uses_ad_path_for_hybrid_identity(tmp_path):
+def _hybrid_observables():
     # Hybrid user: enrichment provides Entra id + on-prem AD id + Defender identity-account id.
-    # Password reset must go through the AD invokeAction path, not the Entra passwordProfile patch.
-    write_job(
-        tmp_path,
-        "check",
-        config_overrides={
-            "Force password reset on true positive": True,
-            "Azure tenant ID": "t",
-            "Azure app client ID": "c",
-            "Azure app client secret": "s",
-        },
-    )
-    hybrid_obs = [
+    return [
         OBSERVABLES[0],
         {
             "dataType": "username",
@@ -466,17 +462,35 @@ def test_check_force_password_reset_uses_ad_path_for_hybrid_identity(tmp_path):
             },
         },
     ]
-    thehive = StubTheHive(hybrid_obs)
+
+
+def test_check_disable_and_password_reset_use_ad_path_for_hybrid_identity(tmp_path):
+    # Disable and password reset must go through the AD invokeAction path, not the Entra Graph calls.
+    write_job(
+        tmp_path,
+        "check",
+        config_overrides={
+            "Disable user on true positive": True,
+            "Force password reset on true positive": True,
+            "Azure tenant ID": "t",
+            "Azure app client ID": "c",
+            "Azure app client secret": "s",
+        },
+    )
+    thehive = StubTheHive(_hybrid_observables())
     defender = StubDefender()
 
     output = run_responder(tmp_path, thehive, StubWhitelist(), defender)
 
     assert output["full"]["verdict"] == "true-positive"
     assert output["full"]["case_closed"] is True
-    # AD path used with (identity_account_id, on-prem object id); Entra patch never called
+    # AD path used with (identity_account_id, on-prem object id); Entra calls never made
+    assert defender.disabled_ad == [(HYBRID_IDENTITY_ACCOUNT_ID, HYBRID_ONPREM_GUID)]
+    assert defender.disabled == []
     assert defender.password_resets_ad == [(HYBRID_IDENTITY_ACCOUNT_ID, HYBRID_ONPREM_GUID)]
     assert defender.password_resets == []
     log_messages = [entry[3] for entry in thehive.logs]
+    assert any("account disabled in AD" in m and "user3" in m for m in log_messages)
     assert any("password reset forced in AD" in m and "user3" in m for m in log_messages)
 
 

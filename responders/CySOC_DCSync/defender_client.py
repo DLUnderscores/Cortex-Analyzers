@@ -49,7 +49,12 @@ class DefenderClient:
             self._tokens[scope] = token
         return self._tokens[scope]
 
-    def disable_user(self, user_id: str) -> None:
+    def disable_user_entra(self, user_id: str) -> None:
+        """Disable a cloud-only Entra user (Graph accountEnabled=false).
+
+        For hybrid identities the disabled state is re-synced from on-prem AD — use disable_user_ad
+        for those (the identityAccounts invokeAction endpoint disables the AD account directly).
+        """
         resp = self.http.patch(
             f"{GRAPH_BASE_URL}/users/{user_id}",
             headers={"Authorization": f"Bearer {self._token(GRAPH_SCOPE)}", "Content-Type": "application/json"},
@@ -58,6 +63,10 @@ class DefenderClient:
         )
         if not (200 <= resp.status_code < 300):
             raise DefenderActionError(f"Failed to disable user {user_id}: HTTP {resp.status_code} — {resp.text}")
+
+    def disable_user_ad(self, identity_account_id: str, account_id: str) -> None:
+        """Disable an on-prem AD account via the Defender identityAccounts invokeAction endpoint."""
+        self._invoke_identity_action(identity_account_id, account_id, "disable")
 
     def force_password_reset_entra(self, user_id: str) -> None:
         """Force a password change at next sign-in for a cloud-only Entra user (Graph passwordProfile).
@@ -77,22 +86,25 @@ class DefenderClient:
             )
 
     def force_password_reset_ad(self, identity_account_id: str, account_id: str) -> None:
-        """Force a password reset on an on-prem AD account via the Defender identityAccounts action.
+        """Force a password reset on an on-prem AD account via the Defender identityAccounts action."""
+        self._invoke_identity_action(identity_account_id, account_id, "forcePasswordReset")
+
+    def _invoke_identity_action(self, identity_account_id: str, account_id: str, action: str) -> None:
+        """POST an action to the Defender identityAccounts invokeAction endpoint (activeDirectory provider).
 
         identity_account_id is the Defender identity-account GUID (path id); account_id is the on-prem
-        AD object id (the analyzer's OnPrem_Object_ID). forcePasswordReset only supports the
-        activeDirectory provider, so this is the path that works for hybrid/on-prem identities.
-        Requires the SecurityIdentitiesActions.ReadWrite.All application permission.
+        AD object id (the analyzer's OnPrem_Object_ID). This is the path that works for hybrid/on-prem
+        identities. Requires the SecurityIdentitiesActions.ReadWrite.All application permission.
         """
         resp = self.http.post(
             f"{GRAPH_BASE_URL}/security/identities/identityAccounts/{identity_account_id}/invokeAction",
             headers={"Authorization": f"Bearer {self._token(GRAPH_SCOPE)}", "Content-Type": "application/json"},
-            json={"accountId": account_id, "action": "forcePasswordReset", "identityProvider": "activeDirectory"},
+            json={"accountId": account_id, "action": action, "identityProvider": "activeDirectory"},
             timeout=30,
         )
         if not (200 <= resp.status_code < 300):
             raise DefenderActionError(
-                f"Failed to force AD password reset for account {account_id}: HTTP {resp.status_code} — {resp.text}"
+                f"Failed to {action} account {account_id} via identityAccounts: HTTP {resp.status_code} — {resp.text}"
             )
 
     def revoke_sessions(self, user_id: str) -> None:

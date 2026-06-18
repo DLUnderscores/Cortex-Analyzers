@@ -221,13 +221,14 @@ class DCSyncWhitelistResponder(Responder):
         return results
 
     @staticmethod
-    def _run_force_password_reset(defender, users):
-        """Force a password reset per unique user, choosing the path that actually works.
+    def _run_identity_action(users, action_type, ad_fn, entra_fn):
+        """Run an identity action per unique user, choosing the path that works for the identity type.
 
-        On-prem/hybrid accounts (identity-account id + on-prem AD id available) go through the
-        Defender identityAccounts invokeAction endpoint (the only path that resets an on-prem-mastered
-        password); cloud-only Entra accounts fall back to the Graph passwordProfile patch. A user with
-        neither usable id pair can't be reset and is recorded as a failure.
+        On-prem/hybrid accounts (identity-account id + on-prem AD id available) go through the Defender
+        identityAccounts invokeAction endpoint via ad_fn(identity_account_id, account_id) — the only path
+        that reaches an on-prem-mastered account; cloud-only Entra accounts fall back to the Graph call
+        via entra_fn(entra_object_id). A user with neither usable id pair can't be actioned and is
+        recorded as a failure. Used for disable and force_password_reset (both support activeDirectory).
         """
         results = []
         for info in users.values():
@@ -242,7 +243,7 @@ class DCSyncWhitelistResponder(Responder):
             else:
                 results.append(
                     {
-                        "type": "force_password_reset",
+                        "type": action_type,
                         "target": target,
                         "id": onprem_object_id or entra_object_id or "",
                         "success": False,
@@ -254,16 +255,16 @@ class DCSyncWhitelistResponder(Responder):
                 continue
             try:
                 if method == "AD":
-                    defender.force_password_reset_ad(identity_account_id, onprem_object_id)
+                    ad_fn(identity_account_id, onprem_object_id)
                 else:
-                    defender.force_password_reset_entra(entra_object_id)
+                    entra_fn(entra_object_id)
                 results.append(
-                    {"type": "force_password_reset", "target": target, "id": action_id, "success": True,
+                    {"type": action_type, "target": target, "id": action_id, "success": True,
                      "method": method, "detail": None}
                 )
             except DefenderActionError as exc:
                 results.append(
-                    {"type": "force_password_reset", "target": target, "id": action_id, "success": False,
+                    {"type": action_type, "target": target, "id": action_id, "success": False,
                      "method": method, "detail": str(exc)}
                 )
         return results
@@ -280,9 +281,17 @@ class DCSyncWhitelistResponder(Responder):
         if any_user_action:
             users = self._unique_users(unmatched)
             if self.disable_user_on_tp:
-                actions.extend(self._try_graph_action("disable_user", users, defender.disable_user))
+                actions.extend(
+                    self._run_identity_action(users, "disable_user", defender.disable_user_ad, defender.disable_user_entra)
+                )
             if self.force_password_reset_on_tp:
-                actions.extend(self._run_force_password_reset(defender, users))
+                actions.extend(
+                    self._run_identity_action(
+                        users, "force_password_reset", defender.force_password_reset_ad, defender.force_password_reset_entra
+                    )
+                )
+            # Session revocation has no activeDirectory/entraID identityAccounts action (revokeAllSessions
+            # is okta-only); it stays on the Graph revokeSignInSessions call, which targets the Entra object.
             if self.revoke_sessions_on_tp:
                 actions.extend(self._try_graph_action("revoke_sessions", users, defender.revoke_sessions))
 
@@ -325,17 +334,17 @@ class DCSyncWhitelistResponder(Responder):
         t, tgt, uid, ok, detail = (
             action["type"], action["target"], action["id"], action["success"], action.get("detail")
         )
+        # method is "Entra" (cloud-only Graph call), "AD" (on-prem/hybrid invokeAction), or None when
+        # no usable id was available to attempt the action at all. revoke_sessions is always Entra.
+        method = action.get("method")
+        where = f" in {method}" if method else ""
         if t == "disable_user":
             msg = (
-                f"{prefix}: account disabled in Entra — {tgt} ({uid})"
+                f"{prefix}: account disabled{where} — {tgt} ({uid})"
                 if ok else
-                f"{prefix}: FAILED to disable account in Entra — {tgt} ({uid}): {detail}"
+                f"{prefix}: FAILED to disable account{where} — {tgt} ({uid}): {detail}"
             )
         elif t == "force_password_reset":
-            # method is "Entra" (cloud-only Graph patch), "AD" (on-prem/hybrid invokeAction), or
-            # None when no usable id was available to attempt a reset at all.
-            method = action.get("method")
-            where = f" in {method}" if method else ""
             msg = (
                 f"{prefix}: password reset forced{where} — {tgt} ({uid})"
                 if ok else
