@@ -34,6 +34,22 @@ def user_obs(data="svc-sync", user_id=USER_GUID, predicate="Account_Object_ID", 
     return observable("username", data, tags=tags, reports=reports)
 
 
+def ip_host_obs(data="10.0.0.5", device_id=DEVICE_ID, tags=()):
+    reports = {"MicrosoftDefender_GetDeviceInfo_1_0": {"taxonomies": [{"predicate": "Device_ID", "value": device_id}]}}
+    return observable("ip", data, tags=tags, reports=reports)
+
+
+def mail_user_obs(data="svc-sync@socdev.lan", user_id=USER_GUID, tags=()):
+    reports = {"MicrosoftDefender_GetUserInfo_1_0": {"taxonomies": [{"predicate": "Account_Object_ID", "value": user_id}]}}
+    return observable("mail", data, tags=tags, reports=reports)
+
+
+def not_found_obs(data_type, data, analyzer="MicrosoftDefender_GetDeviceInfo_1_0", tags=()):
+    # MDE looked the observable up but it is absent — the Not_Found taxonomy carries a null value.
+    reports = {analyzer: {"taxonomies": [{"namespace": "MDE", "predicate": "Not_Found", "value": None}]}}
+    return observable(data_type, data, tags=tags, reports=reports)
+
+
 def test_pair_key_normalizes_case_and_whitespace():
     assert pair_key(f" {USER_GUID.upper()} ", DEVICE_ID.upper()) == f"{USER_GUID}:{DEVICE_ID}"
 
@@ -166,6 +182,68 @@ def test_resolve_only_destination_tagged_yields_no_pairs():
     assert pairs == []
     assert unresolved == []
     assert selection == "source-role-tags"
+
+
+def test_resolve_ip_observable_to_device():
+    pairs, unresolved, _ = PairResolver().resolve([ip_host_obs(), user_obs()])
+    assert unresolved == []
+    assert len(pairs) == 1
+    assert pairs[0]["host"] == "10.0.0.5"
+    assert pairs[0]["device_id"] == DEVICE_ID
+
+
+def test_resolve_mail_observable_to_user():
+    pairs, unresolved, _ = PairResolver().resolve([host_obs(), mail_user_obs()])
+    assert unresolved == []
+    assert len(pairs) == 1
+    assert pairs[0]["user"] == "svc-sync@socdev.lan"
+    assert pairs[0]["user_id"] == USER_GUID
+
+
+def test_resolve_ignores_not_found_observable():
+    # a host MDE looked up but couldn't find is skipped, not unresolved, and doesn't block the job
+    observables = [host_obs(), not_found_obs("ip", "10.9.9.9"), user_obs()]
+    pairs, unresolved, _ = PairResolver().resolve(observables)
+    assert unresolved == []
+    assert len(pairs) == 1
+    assert pairs[0]["host"] == "ws01.socdev.lan"
+
+
+def test_resolve_not_found_only_host_yields_no_pairs():
+    pairs, unresolved, _ = PairResolver().resolve([not_found_obs("hostname", "ghost"), user_obs()])
+    assert unresolved == []
+    assert pairs == []
+
+
+def test_resolve_untagged_treated_as_source_alongside_source_tag():
+    observables = [
+        host_obs("ws01", DEVICE_ID, tags=["MDE:Role=source"]),
+        host_obs("ws02", "f" * 40),  # untagged → source, kept (not dropped)
+        user_obs(tags=["MDE:Role=source"]),
+    ]
+    pairs, unresolved, selection = PairResolver().resolve(observables)
+    assert unresolved == []
+    assert selection == "source-role-tags"
+    assert {p["host"] for p in pairs} == {"ws01", "ws02"}
+
+
+def test_resolve_destination_excludes_same_device_untagged_ip():
+    # the DC is tagged destination only on its hostname; its untagged same-device ip is excluded too
+    observables = [
+        host_obs("dc01", DEVICE_ID, tags=["MDE:Role=destination"]),
+        ip_host_obs("10.0.0.1", DEVICE_ID),
+        user_obs(tags=["MDE:Role=source"]),
+    ]
+    pairs, unresolved, _ = PairResolver().resolve(observables)
+    assert unresolved == []
+    assert pairs == []
+
+
+def test_resolve_deduplicates_hostname_and_ip_same_device():
+    observables = [host_obs("ws01.socdev.lan", DEVICE_ID), ip_host_obs("10.0.0.5", DEVICE_ID), user_obs()]
+    pairs, unresolved, _ = PairResolver().resolve(observables)
+    assert unresolved == []
+    assert len(pairs) == 1
 
 
 def consul_item(key, entries, modify_index=1):

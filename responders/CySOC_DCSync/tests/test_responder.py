@@ -268,6 +268,27 @@ def test_check_fails_safe_on_observable_without_enrichment(tmp_path):
     assert "unresolved" in thehive.logs[0][3]
 
 
+def test_check_ignores_not_found_observable(tmp_path):
+    # an MDE:Not_Found observable is skipped (not unresolved); the valid pair still drives the verdict
+    write_job(tmp_path, "check")
+    not_found = {
+        "dataType": "ip",
+        "data": "10.9.9.9",
+        "tags": [],
+        "reports": {
+            "MicrosoftDefender_GetDeviceInfo_1_0": {
+                "taxonomies": [{"namespace": "MDE", "predicate": "Not_Found", "value": None}]
+            }
+        },
+    }
+    thehive = StubTheHive([not_found, *OBSERVABLES])
+    output = run_responder(tmp_path, thehive, StubWhitelist({PAIR_KEY: {}}))
+
+    assert output["success"] is True
+    assert output["full"]["verdict"] == "false-positive"
+    assert thehive.closed[0] == ("~4128", "false-positive")
+
+
 def test_no_case_id_fails_without_logging(tmp_path):
     write_job(tmp_path, "check", case={"caseId": 1, "title": "no id"})
     thehive = StubTheHive(OBSERVABLES)

@@ -132,7 +132,9 @@ class DCSyncWhitelistResponder(Responder):
                 self._fail(
                     thehive,
                     case_id,
-                    f"Cannot evaluate case {case_id} — no user+host pair could be derived from the case observables",
+                    f"Cannot evaluate case {case_id} — need at least one MDE-resolved device and one "
+                    "MDE-resolved user; every device/user observable was Not_Found in MDE, un-enriched, "
+                    "or excluded as a destination",
                 )
 
             if self.service == "check":

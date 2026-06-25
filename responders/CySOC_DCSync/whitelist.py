@@ -23,8 +23,8 @@ from typing import Optional
 import requests
 import yaml
 
-HOST_DATA_TYPES = ("hostname",)
-USER_DATA_TYPES = ("username",)
+HOST_DATA_TYPES = ("hostname", "ip")
+USER_DATA_TYPES = ("username", "mail")
 
 # Taxonomy predicates produced by the MicrosoftDefender enrichment analyzers
 DEVICE_ID_PREDICATES = ("Device_ID",)
@@ -39,10 +39,20 @@ IDENTITY_ACCOUNT_ID_PREDICATES = ("Identity_Account_ID",)
 # by-products of the investigation, not the DCSync source host/account.
 ARTIFACT_TAG_PREFIX = "MicrosoftDefender"
 
-# Role tags attached during ES→TheHive ingestion from the Defender alert
-# evidence; when present they identify the source of the replication request.
+# Role tags attached by SOAR (StackStorm) from the Defender alert evidence roles
+# (tag spelling "MDE:Role=<role>"; compared lower-cased). They identify the
+# destination of the replication request — the attacked DC — which must never
+# enter a whitelist pair. Untagged observables are treated as source.
 ROLE_TAG_PREFIX = "mde:role="
-ROLE_TAG_SOURCE = "mde:role=source"
+ROLE_TAG_DESTINATION = "mde:role=destination"
+
+# Mini-report taxonomy emitted by the MicrosoftDefender analyzers marking an
+# observable that was looked up but is absent from MDE. Its value is null, so it
+# is detected by predicate presence (taxonomy_value can't see a null value). The
+# tag spelling is tolerated too, in case the chip is mirrored as an observable tag.
+MDE_NAMESPACE = "MDE"
+NOT_FOUND_PREDICATE = "Not_Found"
+NOT_FOUND_TAG = "mde:not_found"
 
 
 class ConsulKVError(Exception):
@@ -119,31 +129,43 @@ def taxonomy_value(observable: dict, predicates: tuple) -> Optional[str]:
     return None
 
 
-def select_source_candidates(candidates: list) -> tuple:
-    """Restrict candidates to the attack source when role tags are present.
+def is_destination(observable: dict) -> bool:
+    """True if the observable is explicitly tagged as the replication destination (attacked DC)."""
+    return any(tag.lower() == ROLE_TAG_DESTINATION for tag in observable.get("tags", []))
 
-    Returns (candidates, role_tags_used). When any candidate carries an
-    mde:role= tag, only candidates tagged as source are kept — the
-    destination (e.g. the attacked domain controller) must never enter the
-    whitelist pair. Without role tags all candidates are kept.
+
+def has_role_tags(candidates: list) -> bool:
+    """True if any candidate carries an mde:role= tag (in either source or destination form)."""
+    return any(tag.lower().startswith(ROLE_TAG_PREFIX) for obs in candidates for tag in obs.get("tags", []))
+
+
+def is_mde_not_found(observable: dict) -> bool:
+    """True if the observable was looked up by MDE but is absent (MDE:Not_Found).
+
+    The Not_Found taxonomy carries a null value, so it's detected by predicate presence rather than
+    taxonomy_value (which requires a truthy value). An observable-tag spelling is honored too.
     """
-    has_role_tags = any(
-        tag.lower().startswith(ROLE_TAG_PREFIX) for obs in candidates for tag in obs.get("tags", [])
-    )
-    if not has_role_tags:
-        return candidates, False
-    return [obs for obs in candidates if any(tag.lower() == ROLE_TAG_SOURCE for tag in obs.get("tags", []))], True
+    for report in (observable.get("reports") or {}).values():
+        for taxonomy in report.get("taxonomies") or []:
+            if taxonomy.get("namespace") == MDE_NAMESPACE and taxonomy.get("predicate") == NOT_FOUND_PREDICATE:
+                return True
+    return any(tag.lower().replace(" ", "") == NOT_FOUND_TAG for tag in observable.get("tags", []))
 
 
 class PairResolver:
     """Resolve case observables to canonical (user, host) pairs.
 
-    When observables carry mde:role= tags (set during alert ingestion from
-    the Defender evidence), only source-tagged candidates are paired.
-    Canonical ids are read exclusively from the enrichment analyzer reports
-    attached to the observables; a selected observable without a report
-    cannot be resolved and is returned as unresolved (the caller fails the
-    job).
+    Role tags (set by SOAR from the Defender evidence) exclude the replication
+    destination — the attacked DC — from pairing. Exclusion is by canonical id,
+    not per-observable: if any observable resolving to a given Device_ID/user id
+    is tagged mde:role=destination, every observable for that identity is dropped
+    (so a destination DC tagged only on its hostname still excludes its untagged,
+    same-machine ip). Untagged observables are treated as source.
+
+    An observable that MDE looked up but couldn't find (MDE:Not_Found) is ignored.
+    Canonical ids are read exclusively from the enrichment analyzer reports; a
+    selected non-destination observable that is neither resolved nor Not_Found is
+    returned as unresolved (the caller fails the job — fail-safe).
     """
 
     def resolve(self, observables: list) -> tuple:
@@ -160,8 +182,9 @@ class PairResolver:
         selection:  "source-role-tags" when role tags narrowed any group, else "all-candidates"
         """
         unresolved = []
-        host_candidates, hosts_by_role = select_source_candidates(select_candidates(observables, HOST_DATA_TYPES))
-        user_candidates, users_by_role = select_source_candidates(select_candidates(observables, USER_DATA_TYPES))
+        host_candidates = select_candidates(observables, HOST_DATA_TYPES)
+        user_candidates = select_candidates(observables, USER_DATA_TYPES)
+        role_tags_used = has_role_tags(host_candidates) or has_role_tags(user_candidates)
         hosts = self._resolve_candidates(host_candidates, DEVICE_ID_PREDICATES, unresolved)
         users = self._resolve_candidates(
             user_candidates,
@@ -189,28 +212,50 @@ class PairResolver:
             for user in users
             for host in hosts
         ]
-        selection = "source-role-tags" if (hosts_by_role or users_by_role) else "all-candidates"
+        selection = "source-role-tags" if role_tags_used else "all-candidates"
         return pairs, unresolved, selection
 
     def _resolve_candidates(self, candidates: list, predicates: tuple, unresolved: list, extra_ids: dict = None) -> list:
-        resolved = []
-        seen_ids = set()
+        """Resolve candidates to canonical-id entries, excluding destination identities.
+
+        Two passes: the first collects the canonical ids of destination-tagged observables (which never
+        need enrichment and are never sources); the second resolves the remaining observables and drops
+        any whose canonical id matched a destination — so a destination DC tagged only on its hostname
+        also excludes its untagged, same-machine ip.
+        """
+        destination_ids = set()
+        sources = []  # (obs, data, matched_predicate, canonical) for non-destination candidates
         for obs in candidates:
             data = (obs.get("data") or "").strip()
             matched_predicate, canonical = self._first_taxonomy_match(obs, predicates)
+            if is_destination(obs):
+                if canonical:
+                    destination_ids.add(canonical.lower())
+                continue
+            sources.append((obs, data, matched_predicate, canonical))
+
+        resolved = []
+        seen_ids = set()
+        for obs, data, matched_predicate, canonical in sources:
             if canonical:
-                if canonical.lower() not in seen_ids:
-                    seen_ids.add(canonical.lower())
+                canonical_id = canonical.lower()
+                if canonical_id in destination_ids:
+                    continue  # same device/user as a destination-tagged observable
+                if canonical_id not in seen_ids:
+                    seen_ids.add(canonical_id)
                     entry = {"data": data, "id": canonical, "id_predicate": matched_predicate}
                     for field, field_predicates in (extra_ids or {}).items():
                         entry[field] = taxonomy_value(obs, field_predicates)
                     resolved.append(entry)
+            elif is_mde_not_found(obs):
+                continue  # looked up by MDE but absent — ignore, don't block the job
             else:
                 unresolved.append(
                     {
                         "data": data,
                         "dataType": obs.get("dataType", ""),
-                        "reason": "no enrichment report with a canonical id — run the MicrosoftDefender analyzers first",
+                        "reason": "no MDE enrichment report — run the MicrosoftDefender analyzer "
+                        "(Not_Found observables are skipped, not unresolved)",
                     }
                 )
         return resolved
