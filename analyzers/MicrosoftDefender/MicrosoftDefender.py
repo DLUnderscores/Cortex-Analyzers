@@ -17,6 +17,7 @@ M365_SCOPE = "https://api.security.microsoft.com/.default"
 
 IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 GUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+SID_RE = re.compile(r"^S-1-5-\d+(?:-\d+)+$", re.I)
 
 RISK_LEVEL_MAP = {
     "critical": "malicious",
@@ -185,17 +186,39 @@ class MicrosoftDefenderAnalyzer(Analyzer):
     # ------------------------------------------------------------------
 
     def _search_user(self, observable: str) -> dict:
-        """Find user via IdentityInfo in the M365 Defender API (cross-product hunting, supports IdentityInfo)."""
+        """Find user via IdentityInfo in the M365 Defender API (cross-product hunting, supports IdentityInfo).
+
+        Resolves by the most specific identifier the observable looks like, then falls back to
+        broader keys. On-prem-only accounts (e.g. AAD Connect service accounts) are frequently
+        absent from IdentityInfo under AccountName, but are resolvable by their on-prem SID or
+        on-prem AD object GUID — the identifiers MDI alert evidence carries as user_sid /
+        activeDirectoryObjectGuid. Each candidate runs as its own query so a column missing from a
+        given IdentityInfo schema version only drops that fallback instead of failing the lookup.
+        """
         safe = observable.replace("'", "''")
-        if GUID_RE.match(observable):
-            query = f"IdentityInfo | where AccountObjectId =~ '{safe}' | take 1"
+        if SID_RE.match(observable):
+            # On-prem AD SID (the user_sid from MDI alert evidence)
+            clauses = [f"OnPremSid =~ '{safe}'"]
+        elif GUID_RE.match(observable):
+            # A GUID may be an Entra object id (AccountObjectId) or an on-prem AD object GUID
+            # (OnPremObjectId — what MDI alert evidence exposes as activeDirectoryObjectGuid).
+            clauses = [f"AccountObjectId =~ '{safe}'", f"OnPremObjectId =~ '{safe}'"]
         elif "@" in observable:
-            query = f"IdentityInfo | where AccountUpn =~ '{safe}' or EmailAddress =~ '{safe}' | take 1"
+            clauses = [f"AccountUpn =~ '{safe}'", f"EmailAddress =~ '{safe}'"]
         else:
-            query = f"IdentityInfo | where AccountName =~ '{safe}' | sort by Timestamp desc | take 1"
-        rows = self._post_m365_optional("advancedhunting/run", {"Query": query}).get("Results", [])
-        if rows:
-            return rows[0]
+            # A bare name: exact SAM/AccountName first, then broaden to the other name columns the
+            # same identity may be indexed under (UPN local part, display name). On-prem service
+            # accounts often sit in IdentityInfo under a name other than the SAM the alert reports.
+            clauses = [
+                f"AccountName =~ '{safe}'",
+                f"AccountUpn startswith '{safe}@'",
+                f"AccountDisplayName =~ '{safe}'",
+            ]
+        for clause in clauses:
+            query = f"IdentityInfo | where {clause} | sort by Timestamp desc | take 1"
+            rows = self._post_m365_optional("advancedhunting/run", {"Query": query}).get("Results", [])
+            if rows:
+                return rows[0]
         self.error(f"No user found in MDE for observable: {observable}")
 
     def _get_user_alerts(self, account_name: str) -> list:
