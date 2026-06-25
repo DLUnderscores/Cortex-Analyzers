@@ -128,7 +128,7 @@ class MicrosoftDefenderAnalyzer(Analyzer):
     # Device search strategies
     # ------------------------------------------------------------------
 
-    def _search_machine(self, observable: str) -> dict:
+    def _search_machine(self, observable: str) -> Optional[dict]:
         safe = observable.lower().replace("'", "''")
         is_ip = bool(IPV4_RE.match(observable)) or self.data_type == "ip"
         is_short = ("." not in observable) and not is_ip
@@ -153,7 +153,7 @@ class MicrosoftDefenderAnalyzer(Analyzer):
             if machines:
                 return machines[0]
 
-        self.error(f"No device found in MDE for observable: {observable}")
+        return None
 
     # ------------------------------------------------------------------
     # Supplementary data fetchers (graceful degradation on failure)
@@ -185,7 +185,7 @@ class MicrosoftDefenderAnalyzer(Analyzer):
     # User search strategies
     # ------------------------------------------------------------------
 
-    def _search_user(self, observable: str) -> dict:
+    def _search_user(self, observable: str) -> Optional[dict]:
         """Find user via IdentityInfo in the M365 Defender API (cross-product hunting, supports IdentityInfo).
 
         Resolves by the most specific identifier the observable looks like, then falls back to
@@ -219,7 +219,7 @@ class MicrosoftDefenderAnalyzer(Analyzer):
             rows = self._post_m365_optional("advancedhunting/run", {"Query": query}).get("Results", [])
             if rows:
                 return rows[0]
-        self.error(f"No user found in MDE for observable: {observable}")
+        return None
 
     def _get_user_alerts(self, account_name: str) -> list:
         data = self._get_optional(f"users/{account_name}/alerts", params={"$filter": "status ne 'Resolved'"})
@@ -239,6 +239,9 @@ class MicrosoftDefenderAnalyzer(Analyzer):
             observable = self.get_data().strip()
             if self.data_type in ("hostname", "fqdn", "ip"):
                 machine = self._search_machine(observable)
+                if machine is None:
+                    self.report({"not_found": True})
+                    return
                 machine_id = machine["id"]
                 device_info = self._get_device_info(machine_id)
                 alerts = self._get_alerts(machine_id)
@@ -252,6 +255,9 @@ class MicrosoftDefenderAnalyzer(Analyzer):
                 })
             elif self.data_type in ("mail", "username"):
                 user = self._search_user(observable)
+                if user is None:
+                    self.report({"not_found": True})
+                    return
                 account_name = user.get("AccountName", "")
                 alerts = self._get_user_alerts(account_name)
                 machines = self._get_user_machines(account_name)
@@ -273,6 +279,14 @@ class MicrosoftDefenderAnalyzer(Analyzer):
         taxonomies = []
         namespace = "MDE"
 
+        if raw.get("not_found"):
+            # value=None (JSON null) renders a bare "MDE:Not_Found" tag in TheHive: the mini-report
+            # UI appends ="..." only when value is neither null nor undefined, and the field must be
+            # present (it's a required JsValue) — omitting it drops the tag, "" renders as ="".
+            return {"taxonomies": [
+                {"level": "malicious", "namespace": namespace, "predicate": "Not_Found", "value": None}
+            ]}
+
         def risk_level(value: str) -> str:
             return RISK_LEVEL_MAP.get((value or "none").lower(), "safe")
 
@@ -282,6 +296,10 @@ class MicrosoftDefenderAnalyzer(Analyzer):
 
         machine = raw.get("machine", {})
         user = raw.get("user", {})
+
+        # Bare green "MDE:Found" tag whenever a device or user was resolved (value=None → no ="..." suffix).
+        if machine or user:
+            taxonomies.append({"level": "safe", "namespace": namespace, "predicate": "Found", "value": None})
 
         if machine:
             device_info = raw.get("device_info", {})
