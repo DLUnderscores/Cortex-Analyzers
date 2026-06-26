@@ -4,6 +4,7 @@ import pytest
 
 from dcsync_whitelist import DCSyncWhitelistResponder
 from defender_client import DefenderActionError
+from usm_client import USMError
 from whitelist import pair_key
 
 USER_GUID = "11111111-2222-3333-4444-555555555555"
@@ -118,11 +119,38 @@ class StubDefender:
         self.isolated.append((device_id, full))
 
 
+class StubUSM:
+    def __init__(self, create_result="created", ticket_no="IN-0005702", fail_create=False, fail_update=False):
+        self.create_result = create_result
+        self.ticket_no = ticket_no
+        self.fail_create = fail_create
+        self.fail_update = fail_update
+        self.created = []  # (title, desc, severity, customer_ref)
+        self.updated = []  # (ticket_no, desc)
+        self.lookups = []  # customer_ref
+
+    def create_ticket(self, title, desc, severity_value, customer_ref):
+        if self.fail_create:
+            raise USMError("create failed")
+        self.created.append((title, desc, severity_value, customer_ref))
+        return self.create_result
+
+    def find_ticket_no(self, customer_ref):
+        self.lookups.append(customer_ref)
+        return self.ticket_no
+
+    def update_ticket(self, ticket_no, desc, status="IN_CRE"):
+        if self.fail_update:
+            raise USMError("update failed")
+        self.updated.append((ticket_no, desc))
+
+
 class ResponderUnderTest(DCSyncWhitelistResponder):
-    def __init__(self, job_directory, thehive, whitelist, defender=None):
+    def __init__(self, job_directory, thehive, whitelist, defender=None, usm=None):
         self.stub_thehive = thehive
         self.stub_whitelist = whitelist
         self.stub_defender = defender
+        self.stub_usm = usm
         super().__init__(job_directory=str(job_directory))
 
     def _thehive(self):
@@ -133,6 +161,9 @@ class ResponderUnderTest(DCSyncWhitelistResponder):
 
     def _defender(self):
         return self.stub_defender
+
+    def _usm(self):
+        return self.stub_usm
 
 
 def write_job(tmp_path, service, case=CASE, config_overrides=None):
@@ -155,10 +186,19 @@ def read_output(tmp_path):
     return json.loads((tmp_path / "output" / "output.json").read_text())
 
 
-def run_responder(tmp_path, thehive, whitelist, defender=None):
-    responder = ResponderUnderTest(tmp_path, thehive, whitelist, defender)
+def run_responder(tmp_path, thehive, whitelist, defender=None, usm=None):
+    responder = ResponderUnderTest(tmp_path, thehive, whitelist, defender, usm)
     responder.run()
     return read_output(tmp_path)
+
+
+# Config that enables USM ticket creation (the stub _usm() is used, so the URL/key just need to be set).
+USM_ENABLED = {
+    "Create USM ticket on true positive": True,
+    "USM URL": "https://usm",
+    "USM API key": "secret",
+    "TheHive public URL": "https://gw.example.com/office/thehive",
+}
 
 
 def two_user_one_host_observables():
@@ -316,6 +356,127 @@ def test_unexpected_error_is_logged_to_task(tmp_path):
     assert output["success"] is False
     assert "FAILED" in thehive.logs[0][3]
     assert "boom" in thehive.logs[0][3]
+
+
+# --- USM ticketing ---------------------------------------------------------
+
+USM_CASE = {**CASE, "severity": 4, "description": "case body"}
+EXPECTED_CUSTOMER_REF = "https://gw.example.com/office/thehive/index.html#!/case/~4128/details"
+
+
+def test_check_tp_creates_usm_ticket(tmp_path):
+    write_job(tmp_path, "check", case=USM_CASE, config_overrides=USM_ENABLED)
+    thehive = StubTheHive(OBSERVABLES)
+    usm = StubUSM(create_result="created")
+    output = run_responder(tmp_path, thehive, StubWhitelist(), usm=usm)
+
+    assert output["full"]["verdict"] == "true-positive"
+    assert output["full"]["usm"] == "created"
+    # title is prefixed with the TheHive case number (CASE.caseId == 42);
+    # severity 4 (Critical) inverts to USM "1"; desc is the case description (no containment actions)
+    assert usm.created == [("Case #42 - DCSync attack detected", "case body", "1", EXPECTED_CUSTOMER_REF)]
+    assert any("USM ticket created" in log[3] for log in thehive.logs)
+    assert thehive.closed[0] == ("~4128", "true-positive")
+
+
+def test_check_usm_title_falls_back_to_bare_title_without_case_number(tmp_path):
+    case = {"_id": "~4128", "title": "DCSync attack detected", "severity": 4, "description": "case body"}
+    write_job(tmp_path, "check", case=case, config_overrides=USM_ENABLED)
+    thehive = StubTheHive(OBSERVABLES)
+    usm = StubUSM(create_result="created")
+    run_responder(tmp_path, thehive, StubWhitelist(), usm=usm)
+
+    assert usm.created[0][0] == "DCSync attack detected"
+
+
+def test_check_usm_create_failure_fails_job_and_leaves_case_open(tmp_path):
+    write_job(tmp_path, "check", case=USM_CASE, config_overrides=USM_ENABLED)
+    thehive = StubTheHive(OBSERVABLES)
+    usm = StubUSM(fail_create=True)
+
+    with pytest.raises(SystemExit):
+        run_responder(tmp_path, thehive, StubWhitelist(), usm=usm)
+
+    output = read_output(tmp_path)
+    assert output["success"] is False
+    assert "USM ticket creation failed" in output["errorMessage"]
+    assert thehive.closed == []  # created before close, so a failed ticket leaves the case open
+    assert any("FAILED" in log[3] for log in thehive.logs)
+
+
+def test_check_existing_usm_ticket_updated_on_reeval(tmp_path):
+    overrides = {**USM_ENABLED, "Update USM ticket on case reevaluation": True}
+    write_job(tmp_path, "check", case=USM_CASE, config_overrides=overrides)
+    thehive = StubTheHive(OBSERVABLES)
+    usm = StubUSM(create_result="exists", ticket_no="IN-0005702")
+    output = run_responder(tmp_path, thehive, StubWhitelist(), usm=usm)
+
+    assert output["full"]["usm"] == "exists"
+    assert usm.lookups == [EXPECTED_CUSTOMER_REF]
+    assert usm.updated == [("IN-0005702", "case body")]
+    assert any("IN-0005702 updated" in log[3] for log in thehive.logs)
+
+
+def test_check_existing_usm_ticket_skipped_when_update_disabled(tmp_path):
+    write_job(tmp_path, "check", case=USM_CASE, config_overrides=USM_ENABLED)
+    thehive = StubTheHive(OBSERVABLES)
+    usm = StubUSM(create_result="exists")
+    output = run_responder(tmp_path, thehive, StubWhitelist(), usm=usm)
+
+    assert output["full"]["usm"] == "exists"
+    assert usm.updated == []
+    assert usm.lookups == []
+    assert any("update disabled" in log[3] for log in thehive.logs)
+
+
+def test_check_usm_update_failure_is_not_fatal(tmp_path):
+    overrides = {**USM_ENABLED, "Update USM ticket on case reevaluation": True}
+    write_job(tmp_path, "check", case=USM_CASE, config_overrides=overrides)
+    thehive = StubTheHive(OBSERVABLES)
+    usm = StubUSM(create_result="exists", fail_update=True)
+    output = run_responder(tmp_path, thehive, StubWhitelist(), usm=usm)
+
+    assert output["success"] is True
+    assert output["full"]["usm"] == "exists"
+    assert thehive.closed[0] == ("~4128", "true-positive")
+    assert any("FAILED to update existing USM ticket" in log[3] for log in thehive.logs)
+
+
+def test_check_fp_does_not_create_usm_ticket(tmp_path):
+    write_job(tmp_path, "check", case=USM_CASE, config_overrides=USM_ENABLED)
+    thehive = StubTheHive(OBSERVABLES)
+    usm = StubUSM()
+    output = run_responder(tmp_path, thehive, StubWhitelist({PAIR_KEY: {"account": "svc-sync"}}), usm=usm)
+
+    assert output["full"]["verdict"] == "false-positive"
+    assert output["full"]["usm"] is None
+    assert usm.created == []
+
+
+def test_check_whitelist_not_configured_creates_usm_ticket(tmp_path):
+    overrides = {**USM_ENABLED, "Consul KV whitelist": ""}
+    write_job(tmp_path, "check", case=USM_CASE, config_overrides=overrides)
+    thehive = StubTheHive(OBSERVABLES)
+    usm = StubUSM(create_result="created")
+    output = run_responder(tmp_path, thehive, StubWhitelist(), usm=usm)
+
+    assert output["full"]["verdict"] == "true-positive"
+    assert output["full"]["case_closed"] is False  # left open for manual review
+    assert output["full"]["usm"] == "created"
+    assert len(usm.created) == 1
+
+
+def test_check_usm_enabled_without_config_fails(tmp_path):
+    overrides = {"Create USM ticket on true positive": True}  # no USM URL / key / public URL
+    write_job(tmp_path, "check", case=USM_CASE, config_overrides=overrides)
+    thehive = StubTheHive(OBSERVABLES)
+
+    with pytest.raises(SystemExit):
+        run_responder(tmp_path, thehive, StubWhitelist(), usm=StubUSM())
+
+    output = read_output(tmp_path)
+    assert output["success"] is False
+    assert "TheHive public URL are required" in output["errorMessage"]
 
 
 def test_check_containment_actions_only_target_non_whitelisted_pair(tmp_path):

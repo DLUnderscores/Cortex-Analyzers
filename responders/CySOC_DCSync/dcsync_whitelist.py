@@ -40,6 +40,7 @@ from cortexutils.responder import Responder
 
 from defender_client import DefenderActionError, DefenderClient
 from thehive_client import TheHiveClient, TheHiveError
+from usm_client import USMClient, USMError
 from whitelist import ConsulKVError, ConsulWhitelist, PairResolver
 
 LOG_TASK_GROUP = "CySOC"
@@ -71,6 +72,15 @@ class DCSyncWhitelistResponder(Responder):
         self.revoke_sessions_on_tp = self.get_param("config.Revoke sessions on true positive", False)
         self.isolate_device_on_tp = self.get_param("config.Isolate device on true positive", False)
         self.full_isolation = self.get_param("config.Full isolation", False)
+        # USM (service-desk) ticketing on true-positive, off by default. The public TheHive URL is
+        # the browser-reachable base used to build the ticket's customerRef (the internal "TheHive
+        # URL" above is a cluster address and not reachable from an analyst's browser). USM URL/key
+        # are required only when ticket creation is enabled (checked in run()).
+        self.thehive_public_url = self.get_param("config.TheHive public URL", None)
+        self.create_usm_ticket_on_tp = self.get_param("config.Create USM ticket on true positive", False)
+        self.usm_url = self.get_param("config.USM URL", None)
+        self.usm_api_key = self.get_param("config.USM API key", None)
+        self.update_usm_ticket_on_reeval = self.get_param("config.Update USM ticket on case reevaluation", False)
 
     # Factories kept separate so tests can substitute fakes.
     def _thehive(self):
@@ -81,6 +91,9 @@ class DCSyncWhitelistResponder(Responder):
 
     def _defender(self):
         return DefenderClient(self.tenant_id, self.client_id, self.client_secret)
+
+    def _usm(self):
+        return USMClient(self.usm_url, self.usm_api_key)
 
     def _resolver(self):
         return PairResolver()
@@ -150,6 +163,15 @@ class DCSyncWhitelistResponder(Responder):
                         case_id,
                         "Azure tenant ID / Azure app client ID / Azure app client secret are required "
                         "when any true-positive containment action is enabled",
+                    )
+                if self.create_usm_ticket_on_tp and not (
+                    self.usm_url and self.usm_api_key and self.thehive_public_url
+                ):
+                    self._fail(
+                        thehive,
+                        case_id,
+                        "USM URL / USM API key / TheHive public URL are required when "
+                        "'Create USM ticket on true positive' is enabled",
                     )
                 whitelist = self._whitelist() if self.consul_kv_whitelist else None
                 defender = self._defender() if actions_enabled else None
@@ -367,6 +389,86 @@ class DCSyncWhitelistResponder(Responder):
             )
         self._log(thehive, case_id, msg)
 
+    @staticmethod
+    def _usm_title(case):
+        """USM ticket title, prefixed with the TheHive case number (e.g. 'Case #350 - <title>').
+
+        Falls back to the bare title if the case number isn't present.
+        """
+        title = case.get("title", "")
+        number = case.get("caseId") or case.get("number")
+        return f"Case #{number} - {title}" if number else title
+
+    @staticmethod
+    def _usm_severity(severity):
+        """Map a TheHive severity (1=Low..4=Critical) to the USM urgency/impact scale (1=critical..4=Low).
+
+        The two scales are inverted. Falls back to "3" (medium) for a missing/unexpected value.
+        """
+        return {4: "1", 3: "2", 2: "3", 1: "4"}.get(severity, "3")
+
+    @staticmethod
+    def _build_usm_desc(case, actions):
+        """Ticket description: the case description plus, if any, the containment actions taken."""
+        desc = case.get("description") or ""
+        if actions:
+            lines = []
+            for a in actions:
+                method = a.get("method")
+                where = f" in {method}" if method else ""
+                status = "OK" if a["success"] else "FAILED"
+                detail = f" — {a['detail']}" if a.get("detail") else ""
+                lines.append(f"- {a['type']}{where} on {a['target']} ({a['id']}): {status}{detail}")
+            desc = f"{desc}\n\nContainment actions taken:\n" + "\n".join(lines)
+        return desc
+
+    def _handle_usm(self, thehive, case, case_id, actions):
+        """Create (or, on reevaluation, update) a USM ticket for a true-positive case.
+
+        No-op unless 'Create USM ticket on true positive' is enabled. Creation failure fails the
+        job (the only USM failure that does — see run() / the responder contract); a customerRef
+        that already exists is benign and, when 'Update USM ticket on case reevaluation' is enabled,
+        the existing ticket is updated best-effort (an update failure is logged, not fatal).
+        """
+        if not self.create_usm_ticket_on_tp:
+            return None
+        usm = self._usm()
+        customer_ref = f"{self.thehive_public_url.rstrip('/')}/index.html#!/case/{case_id}/details"
+        title = self._usm_title(case)
+        desc = self._build_usm_desc(case, actions)
+        severity = self._usm_severity(case.get("severity"))
+        try:
+            result = usm.create_ticket(title, desc, severity, customer_ref)
+        except USMError as exc:
+            self._fail(thehive, case_id, f"USM ticket creation failed: {exc}")
+            return None  # unreachable — _fail exits — but keeps the contract explicit
+        if result == "created":
+            self._log(thehive, case_id, f"{LOG_PREFIX['check']}: USM ticket created — {customer_ref}")
+            return "created"
+        # result == "exists": the case already has a ticket
+        if self.update_usm_ticket_on_reeval:
+            try:
+                ticket_no = usm.find_ticket_no(customer_ref)
+                if ticket_no:
+                    usm.update_ticket(ticket_no, desc)
+                    self._log(thehive, case_id, f"{LOG_PREFIX['check']}: USM ticket {ticket_no} updated")
+                else:
+                    self._log(
+                        thehive,
+                        case_id,
+                        f"{LOG_PREFIX['check']}: USM ticket exists but its number could not be resolved — "
+                        "update skipped",
+                    )
+            except USMError as exc:
+                self._log(thehive, case_id, f"{LOG_PREFIX['check']}: FAILED to update existing USM ticket — {exc}")
+        else:
+            self._log(
+                thehive,
+                case_id,
+                f"{LOG_PREFIX['check']}: USM ticket already exists — update disabled, skipped",
+            )
+        return "exists"
+
     def check(self, case, case_id, thehive, whitelist, defender, pairs, pair_selection):
         entries = whitelist.entries() if whitelist else {}
         matched, unmatched = [], []
@@ -378,8 +480,10 @@ class DCSyncWhitelistResponder(Responder):
 
         case_closed = False
         actions = []
+        usm_result = None
         if whitelist is None:
             verdict = "true-positive"
+            usm_result = self._handle_usm(thehive, case, case_id, actions)
             log_message = (
                 f"{LOG_PREFIX['check']}: whitelist not configured — cannot confirm status, case left open "
                 "for manual review. Pair(s) evaluated: " + ", ".join(f"{p['user']}@{p['host']}" for p in pairs)
@@ -392,6 +496,9 @@ class DCSyncWhitelistResponder(Responder):
             actions, all_succeeded = self._containment_actions(defender, case, unmatched)
             for action in actions:
                 self._log_action(thehive, case_id, action)
+            # Create the ticket before closing: a failed creation fails the job and leaves the case
+            # open (containment has already run regardless of the ticket outcome).
+            usm_result = self._handle_usm(thehive, case, case_id, actions)
             if all_succeeded:
                 thehive.close_case_true_positive(case_id)
                 case_closed = True
@@ -424,6 +531,7 @@ class DCSyncWhitelistResponder(Responder):
                 "matched": matched,
                 "unmatched": unmatched,
                 "actions": actions,
+                "usm": usm_result,
                 "case_closed": case_closed,
             }
         )
