@@ -34,6 +34,10 @@ USER_ID_PREDICATES = ("Account_Object_ID", "OnPrem_Object_ID")
 ENTRA_OBJECT_ID_PREDICATES = ("Account_Object_ID",)
 ONPREM_OBJECT_ID_PREDICATES = ("OnPrem_Object_ID",)
 IDENTITY_ACCOUNT_ID_PREDICATES = ("Identity_Account_ID",)
+# Human-readable user labels emitted by the GetUserInfo analyzer, preferred (in this order) over the
+# raw observable text for display/metadata — so a user observable spelled as an Entra object-id GUID
+# is still labelled with its UPN instead of the GUID. Matching is unaffected (it uses the canonical id).
+USER_DISPLAY_PREDICATES = ("UPN", "Display_Name")
 
 # Observables created by enrichment analyzers carry this tag; they are
 # by-products of the investigation, not the DCSync source host/account.
@@ -195,6 +199,7 @@ class PairResolver:
                 "onprem_object_id": ONPREM_OBJECT_ID_PREDICATES,
                 "identity_account_id": IDENTITY_ACCOUNT_ID_PREDICATES,
             },
+            display_predicates=USER_DISPLAY_PREDICATES,
         )
 
         pairs = [
@@ -215,13 +220,20 @@ class PairResolver:
         selection = "source-role-tags" if role_tags_used else "all-candidates"
         return pairs, unresolved, selection
 
-    def _resolve_candidates(self, candidates: list, predicates: tuple, unresolved: list, extra_ids: dict = None) -> list:
+    def _resolve_candidates(
+        self, candidates: list, predicates: tuple, unresolved: list, extra_ids: dict = None,
+        display_predicates: tuple = None,
+    ) -> list:
         """Resolve candidates to canonical-id entries, excluding destination identities.
 
         Two passes: the first collects the canonical ids of destination-tagged observables (which never
         need enrichment and are never sources); the second resolves the remaining observables and drops
         any whose canonical id matched a destination — so a destination DC tagged only on its hostname
         also excludes its untagged, same-machine ip.
+
+        When display_predicates is given, the entry's "data" (its human-readable label) is taken from the
+        first matching enrichment taxonomy (e.g. UPN, then Display_Name), falling back to the observable's
+        own data when none is present — so a friendlier name is used whenever the analyzer resolved one.
         """
         destination_ids = set()
         sources = []  # (obs, data, matched_predicate, canonical) for non-destination candidates
@@ -243,7 +255,8 @@ class PairResolver:
                     continue  # same device/user as a destination-tagged observable
                 if canonical_id not in seen_ids:
                     seen_ids.add(canonical_id)
-                    entry = {"data": data, "id": canonical, "id_predicate": matched_predicate}
+                    display = taxonomy_value(obs, display_predicates) if display_predicates else None
+                    entry = {"data": display or data, "id": canonical, "id_predicate": matched_predicate}
                     for field, field_predicates in (extra_ids or {}).items():
                         entry[field] = taxonomy_value(obs, field_predicates)
                     resolved.append(entry)

@@ -93,6 +93,23 @@ def test_resolve_pairs_from_reports():
     assert pairs[0]["host"] == "ws01.socdev.lan"
 
 
+def test_resolve_user_display_prefers_upn_over_raw_observable_data():
+    # observable spelled as the Entra object-id GUID, but the report carries a UPN → label is the UPN
+    user = user_obs(data=USER_GUID, extra={"UPN": "dcsync@contoso.onmicrosoft.com", "Display_Name": "DC Sync"})
+    pairs, _, _ = PairResolver().resolve([host_obs(), user])
+    assert pairs[0]["user"] == "dcsync@contoso.onmicrosoft.com"
+    assert pairs[0]["key"] == pair_key(USER_GUID, DEVICE_ID)  # matching still keyed on the object id
+
+
+def test_resolve_user_display_falls_back_to_display_name_then_data():
+    by_display_name = user_obs(data=USER_GUID, extra={"Display_Name": "DC Sync"})
+    pairs, _, _ = PairResolver().resolve([host_obs(), by_display_name])
+    assert pairs[0]["user"] == "DC Sync"
+    # no UPN/Display_Name in the report → keep the observable's own text
+    pairs2, _, _ = PairResolver().resolve([host_obs(), user_obs(data="svc-sync")])
+    assert pairs2[0]["user"] == "svc-sync"
+
+
 def test_resolve_records_user_id_predicate_for_entra_id():
     pairs, _, _ = PairResolver().resolve([host_obs(), user_obs()])
     assert pairs[0]["user_id_predicate"] == "Account_Object_ID"
