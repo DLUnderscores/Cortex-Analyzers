@@ -31,96 +31,44 @@ Both services append a one-line summary of the decision to a TheHive task
 (group "CySOC", title "Log"), creating it on the case if it doesn't exist
 yet, so analysts can see why a case was auto-closed (or why it wasn't, e.g.
 a containment action failed) without digging through the responder job
-output.
+output. The shared scaffolding (task logging, client factories, MDE device
+isolation, USM ticketing) lives in base.CySOCResponder.
 """
 import traceback
 from datetime import datetime, timezone
 
-from cortexutils.responder import Responder
-
-from defender_client import DefenderActionError, DefenderClient
-from thehive_client import TheHiveClient, TheHiveError
-from usm_client import USMClient, USMError
+from base import CySOCResponder
+from defender_client import DefenderActionError
+from thehive_client import TheHiveError
 from whitelist import ConsulKVError, ConsulWhitelist, PairResolver
-
-LOG_TASK_GROUP = "CySOC"
-LOG_TASK_TITLE = "Log"
 
 # Log-line prefixes, named after the responder definitions analysts see in TheHive.
 LOG_PREFIX = {"check": "CySOC_DCSync_Respond", "update": "CySOC_DCSync_UpdateWhitelist"}
 
 
-class DCSyncWhitelistResponder(Responder):
+class DCSyncWhitelistResponder(CySOCResponder):
     def __init__(self, job_directory=None):
-        Responder.__init__(self, job_directory)
+        super().__init__(job_directory)
         self.service = self.get_param("config.service", None, "Service parameter is missing")
-        self.thehive_url = self.get_param("config.TheHive URL", None, "TheHive URL is missing")
-        self.thehive_api_key = self.get_param("config.TheHive API key", None, "TheHive API key is missing")
         self.consul_url = self.get_param("config.Consul URL", "http://consul.service.consul:8500")
         # Optional for "check" — an unconfigured whitelist fails safe to "not whitelisted"
         # rather than blocking the job. Required for "update" (enforced in run()).
         self.consul_kv_whitelist = self.get_param("config.Consul KV whitelist", None)
         self.consul_token = self.get_param("config.Consul ACL token", None)
-        self.close_on_fp = self.get_param("config.Close on false positive", True)
-        # Containment actions on true-positive, off by default. Azure credentials are only
-        # required when one of these is enabled (checked in run()).
-        self.tenant_id = self.get_param("config.Azure tenant ID", None)
-        self.client_id = self.get_param("config.Azure app client ID", None)
-        self.client_secret = self.get_param("config.Azure app client secret", None)
+        # User-identity containment actions on true-positive, off by default. Azure credentials are
+        # only required when one of these (or device isolation) is enabled (checked in run()).
         self.disable_user_on_tp = self.get_param("config.Disable user on true positive", False)
         self.force_password_reset_on_tp = self.get_param("config.Force password reset on true positive", False)
         self.revoke_sessions_on_tp = self.get_param("config.Revoke sessions on true positive", False)
-        self.isolate_device_on_tp = self.get_param("config.Isolate device on true positive", False)
-        self.full_isolation = self.get_param("config.Full isolation", False)
-        # USM (service-desk) ticketing on true-positive, off by default. The public TheHive URL is
-        # the browser-reachable base used to build the ticket's customerRef (the internal "TheHive
-        # URL" above is a cluster address and not reachable from an analyst's browser). USM URL/key
-        # are required only when ticket creation is enabled (checked in run()).
-        self.thehive_public_url = self.get_param("config.TheHive public URL", None)
-        self.create_usm_ticket_on_tp = self.get_param("config.Create USM ticket on true positive", False)
-        self.usm_url = self.get_param("config.USM URL", None)
-        self.usm_api_key = self.get_param("config.USM API key", None)
-        self.update_usm_ticket_on_reeval = self.get_param("config.Update USM ticket on case reevaluation", False)
 
-    # Factories kept separate so tests can substitute fakes.
-    def _thehive(self):
-        return TheHiveClient(self.thehive_url, self.thehive_api_key)
+    def _log_prefix(self):
+        return LOG_PREFIX.get(self.service, self.service)
 
     def _whitelist(self):
         return ConsulWhitelist(self.consul_url, self.consul_kv_whitelist, token=self.consul_token)
 
-    def _defender(self):
-        return DefenderClient(self.tenant_id, self.client_id, self.client_secret)
-
-    def _usm(self):
-        return USMClient(self.usm_url, self.usm_api_key)
-
     def _resolver(self):
         return PairResolver()
-
-    def _log(self, thehive, case_id, message):
-        """Best-effort: a logging hiccup must never fail the job whose result it's recording.
-
-        Only the first call per run performs a dedup check against TheHive's last task log — this
-        prevents repeating an identical run-level verdict from a previous execution. All subsequent
-        calls within the same run bypass dedup so per-action entries are always written.
-        """
-        is_first = not self._run_log_done
-        self._run_log_done = True
-        try:
-            thehive.log_to_task(case_id, LOG_TASK_GROUP, LOG_TASK_TITLE, message, dedup=is_first)
-        except TheHiveError:
-            pass
-
-    def _log_failure(self, thehive, case_id, message):
-        """Best-effort: only possible once a case/TheHive client is known, so it's a no-op before that."""
-        if case_id and thehive:
-            prefix = LOG_PREFIX.get(self.service, self.service)
-            self._log(thehive, case_id, f"{prefix}: FAILED — {message}")
-
-    def _fail(self, thehive, case_id, message):
-        self._log_failure(thehive, case_id, message)
-        self.error(message)
 
     def run(self):
         self._run_log_done = False  # reset each run; first _log call gets dedup, rest bypass it
@@ -320,35 +268,11 @@ class DCSyncWhitelistResponder(Responder):
                 actions.extend(self._try_graph_action("revoke_sessions", users, defender.revoke_sessions))
 
         if self.isolate_device_on_tp:
-            isolation_type = "Full" if self.full_isolation else "Selective"
             devices = {}
             for pair in unmatched:
                 devices.setdefault(pair["device_id"], pair["host"])
             comment = f"CySOC DCSync — TheHive case {case.get('caseId') or case.get('number')}"
-            for device_id, host in devices.items():
-                try:
-                    defender.isolate_device(device_id, comment, full=self.full_isolation)
-                    actions.append(
-                        {
-                            "type": "isolate_device",
-                            "target": host,
-                            "id": device_id,
-                            "success": True,
-                            "detail": None,
-                            "isolation_type": isolation_type,
-                        }
-                    )
-                except DefenderActionError as exc:
-                    actions.append(
-                        {
-                            "type": "isolate_device",
-                            "target": host,
-                            "id": device_id,
-                            "success": False,
-                            "detail": str(exc),
-                            "isolation_type": isolation_type,
-                        }
-                    )
+            actions.extend(self._isolate_devices(defender, devices, comment))
 
         return actions, all(a["success"] for a in actions)
 
@@ -388,86 +312,6 @@ class DCSyncWhitelistResponder(Responder):
                 f"{prefix}: FAILED to isolate device in MDE — {tgt} ({uid}): {detail}"
             )
         self._log(thehive, case_id, msg)
-
-    @staticmethod
-    def _usm_title(case):
-        """USM ticket title, prefixed with the TheHive case number (e.g. 'Case #350 - <title>').
-
-        Falls back to the bare title if the case number isn't present.
-        """
-        title = case.get("title", "")
-        number = case.get("caseId") or case.get("number")
-        return f"Case #{number} - {title}" if number else title
-
-    @staticmethod
-    def _usm_severity(severity):
-        """Map a TheHive severity (1=Low..4=Critical) to the USM urgency/impact scale (1=critical..4=Low).
-
-        The two scales are inverted. Falls back to "3" (medium) for a missing/unexpected value.
-        """
-        return {4: "1", 3: "2", 2: "3", 1: "4"}.get(severity, "3")
-
-    @staticmethod
-    def _build_usm_desc(case, actions):
-        """Ticket description: the case description plus, if any, the containment actions taken."""
-        desc = case.get("description") or ""
-        if actions:
-            lines = []
-            for a in actions:
-                method = a.get("method")
-                where = f" in {method}" if method else ""
-                status = "OK" if a["success"] else "FAILED"
-                detail = f" — {a['detail']}" if a.get("detail") else ""
-                lines.append(f"- {a['type']}{where} on {a['target']} ({a['id']}): {status}{detail}")
-            desc = f"{desc}\n\nContainment actions taken:\n" + "\n".join(lines)
-        return desc
-
-    def _handle_usm(self, thehive, case, case_id, actions):
-        """Create (or, on reevaluation, update) a USM ticket for a true-positive case.
-
-        No-op unless 'Create USM ticket on true positive' is enabled. Creation failure fails the
-        job (the only USM failure that does — see run() / the responder contract); a customerRef
-        that already exists is benign and, when 'Update USM ticket on case reevaluation' is enabled,
-        the existing ticket is updated best-effort (an update failure is logged, not fatal).
-        """
-        if not self.create_usm_ticket_on_tp:
-            return None
-        usm = self._usm()
-        customer_ref = f"{self.thehive_public_url.rstrip('/')}/index.html#!/case/{case_id}/details"
-        title = self._usm_title(case)
-        desc = self._build_usm_desc(case, actions)
-        severity = self._usm_severity(case.get("severity"))
-        try:
-            result = usm.create_ticket(title, desc, severity, customer_ref)
-        except USMError as exc:
-            self._fail(thehive, case_id, f"USM ticket creation failed: {exc}")
-            return None  # unreachable — _fail exits — but keeps the contract explicit
-        if result == "created":
-            self._log(thehive, case_id, f"{LOG_PREFIX['check']}: USM ticket created — {customer_ref}")
-            return "created"
-        # result == "exists": the case already has a ticket
-        if self.update_usm_ticket_on_reeval:
-            try:
-                ticket_no = usm.find_ticket_no(customer_ref)
-                if ticket_no:
-                    usm.update_ticket(ticket_no, desc)
-                    self._log(thehive, case_id, f"{LOG_PREFIX['check']}: USM ticket {ticket_no} updated")
-                else:
-                    self._log(
-                        thehive,
-                        case_id,
-                        f"{LOG_PREFIX['check']}: USM ticket exists but its number could not be resolved — "
-                        "update skipped",
-                    )
-            except USMError as exc:
-                self._log(thehive, case_id, f"{LOG_PREFIX['check']}: FAILED to update existing USM ticket — {exc}")
-        else:
-            self._log(
-                thehive,
-                case_id,
-                f"{LOG_PREFIX['check']}: USM ticket already exists — update disabled, skipped",
-            )
-        return "exists"
 
     def check(self, case, case_id, thehive, whitelist, defender, pairs, pair_selection):
         entries = whitelist.entries() if whitelist else {}

@@ -98,6 +98,37 @@ def test_isolate_device_raises_on_error(fake_http):
         client.isolate_device(DEVICE_ID, "comment")
 
 
+def test_run_antivirus_scan_defaults_to_quick(fake_http):
+    token_route(fake_http)
+    fake_http.route("POST", f"/machines/{DEVICE_ID}/runAntiVirusScan", FakeResponse(200, {}))
+    client = DefenderClient(TENANT_ID, "client", "secret", http=fake_http)
+
+    client.run_antivirus_scan(DEVICE_ID, "comment")
+
+    scan_call = [c for c in fake_http.calls if c["url"].endswith("/runAntiVirusScan")][0]
+    assert scan_call["json"] == {"Comment": "comment", "ScanType": "Quick"}
+
+
+def test_run_antivirus_scan_full_when_requested(fake_http):
+    token_route(fake_http)
+    fake_http.route("POST", f"/machines/{DEVICE_ID}/runAntiVirusScan", FakeResponse(200, {}))
+    client = DefenderClient(TENANT_ID, "client", "secret", http=fake_http)
+
+    client.run_antivirus_scan(DEVICE_ID, "comment", full=True)
+
+    scan_call = [c for c in fake_http.calls if c["url"].endswith("/runAntiVirusScan")][0]
+    assert scan_call["json"] == {"Comment": "comment", "ScanType": "Full"}
+
+
+def test_run_antivirus_scan_raises_on_error(fake_http):
+    token_route(fake_http)
+    fake_http.route("POST", f"/machines/{DEVICE_ID}/runAntiVirusScan", FakeResponse(500, text="boom"))
+    client = DefenderClient(TENANT_ID, "client", "secret", http=fake_http)
+
+    with pytest.raises(DefenderActionError):
+        client.run_antivirus_scan(DEVICE_ID, "comment")
+
+
 def test_token_is_cached_per_scope(fake_http):
     token_calls = {"count": 0}
 

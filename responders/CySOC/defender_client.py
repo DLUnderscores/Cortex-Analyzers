@@ -127,3 +127,19 @@ class DefenderClient:
         )
         if not (200 <= resp.status_code < 300):
             raise DefenderActionError(f"Failed to isolate device {device_id}: HTTP {resp.status_code} — {resp.text}")
+
+    def run_antivirus_scan(self, device_id: str, comment: str, full: bool = False) -> None:
+        """Trigger a Microsoft Defender Antivirus scan on a device (Quick unless full=True).
+
+        Requires the Defender for Endpoint 'Machine.Scan' application permission.
+        """
+        resp = self.http.post(
+            f"{MDE_BASE_URL}/machines/{device_id}/runAntiVirusScan",
+            headers={"Authorization": f"Bearer {self._token(MDE_SCOPE)}", "Content-Type": "application/json"},
+            json={"Comment": comment, "ScanType": "Full" if full else "Quick"},
+            timeout=30,
+        )
+        if not (200 <= resp.status_code < 300):
+            raise DefenderActionError(
+                f"Failed to run antivirus scan on device {device_id}: HTTP {resp.status_code} — {resp.text}"
+            )

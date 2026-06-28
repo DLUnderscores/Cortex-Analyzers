@@ -66,6 +66,28 @@ def test_close_case_true_positive_never_touches_summary(fake_http):
     assert body == {"status": "Resolved", "resolutionStatus": "TruePositive", "impactStatus": "WithImpact"}
 
 
+def test_close_case_indeterminate_sends_two_patches_in_order(fake_http):
+    fake_http.route("PATCH", f"/api/case/{CASE_ID}", FakeResponse(200, {}))
+    client = TheHiveClient("http://thehive", "key", http=fake_http)
+
+    client.close_case_indeterminate(CASE_ID)
+
+    patch_calls = [c for c in fake_http.calls if c["method"] == "PATCH"]
+    assert len(patch_calls) == 2
+    assert patch_calls[0]["json"] == {"status": "Resolved"}
+    body = patch_calls[1]["json"]
+    assert "status" not in body
+    assert body == {"resolutionStatus": "Indeterminate", "impactStatus": "NotApplicable"}
+
+
+def test_close_case_indeterminate_raises_on_error(fake_http):
+    fake_http.route("PATCH", f"/api/case/{CASE_ID}", FakeResponse(500, text="server error"))
+    client = TheHiveClient("http://thehive", "key", http=fake_http)
+
+    with pytest.raises(TheHiveError):
+        client.close_case_indeterminate(CASE_ID)
+
+
 def test_create_task_completes_it_immediately(fake_http):
     fake_http.route("POST", f"/api/case/{CASE_ID}/task", FakeResponse(201, {"_id": TASK_ID}))
     fake_http.route("PATCH", f"/api/case/task/{TASK_ID}", FakeResponse(200, {}))

@@ -1,0 +1,170 @@
+{
+    "name": "CySOC_DCSync_Respond",
+    "version": "1.0",
+    "author": "CySOC",
+    "url": "https://github.com/TheHive-Project/Cortex-Analyzers",
+    "license": "AGPL-V3",
+    "description": "Evaluate a DCSync case against the user+host whitelist stored in Consul KV. Stable identifiers (Microsoft Defender device id, directory object id) are read from the MicrosoftDefender enrichment analyzer reports attached to the observables, so any spelling of the same user/host matches the same whitelist entry. All pairs whitelisted: closes the case as a false positive. Any pair not whitelisted: optionally disables the user's Entra account and/or isolates the source device (only the non-whitelisted user/device pairs), then closes the case as a true positive only if every attempted action succeeded — otherwise the case is left open. Fails without closing when an observable lacks enrichment. The decision is always logged to a 'CySOC/Log' task on the case.",
+    "dataTypeList": [
+        "thehive:case"
+    ],
+    "command": "CySOC/dcsync_whitelist.py",
+    "baseConfig": "CySOC_DCSync",
+    "config": {
+        "service": "check"
+    },
+    "configurationItems": [
+        {
+            "name": "TheHive URL",
+            "description": "TheHive base URL",
+            "type": "string",
+            "multi": false,
+            "required": true,
+            "defaultValue": ""
+        },
+        {
+            "name": "TheHive API key",
+            "description": "TheHive API key with permission to read observables and close cases",
+            "type": "string",
+            "multi": false,
+            "required": true,
+            "defaultValue": ""
+        },
+        {
+            "name": "Consul URL",
+            "description": "Consul HTTP API base URL",
+            "type": "string",
+            "multi": false,
+            "required": true,
+            "defaultValue": "http://consul.service.consul:8500"
+        },
+        {
+            "name": "Consul KV whitelist",
+            "description": "Exact Consul KV path to the whitelist key (a single key holding a YAML document, not a directory prefix). Leave empty to skip the whitelist check — every pair is then treated as not whitelisted (true positive, case stays open)",
+            "type": "string",
+            "multi": false,
+            "required": false,
+            "defaultValue": ""
+        },
+        {
+            "name": "Consul ACL token",
+            "description": "Consul ACL token (optional)",
+            "type": "string",
+            "multi": false,
+            "required": false,
+            "defaultValue": ""
+        },
+        {
+            "name": "Close on false positive",
+            "description": "Close the case automatically when every user+host pair is whitelisted",
+            "type": "boolean",
+            "multi": false,
+            "required": false,
+            "defaultValue": true
+        },
+        {
+            "name": "Azure tenant ID",
+            "description": "Azure AD tenant id. Required only if any true-positive containment action is enabled",
+            "type": "string",
+            "multi": false,
+            "required": false,
+            "defaultValue": ""
+        },
+        {
+            "name": "Azure app client ID",
+            "description": "Azure AD app registration (client) id, granted Microsoft Graph 'User.EnableDisableAccount.All' + 'User.ReadWrite.All' + 'User.RevokeSessions.All' and a Defender for Endpoint machine-action permission (e.g. 'Machine.Isolate'). Required only if any true-positive containment action is enabled",
+            "type": "string",
+            "multi": false,
+            "required": false,
+            "defaultValue": ""
+        },
+        {
+            "name": "Azure app client secret",
+            "description": "Client secret for the app registration above. Required only if any true-positive containment action is enabled",
+            "type": "string",
+            "multi": false,
+            "required": false,
+            "defaultValue": ""
+        },
+        {
+            "name": "Disable user on true positive",
+            "description": "On true-positive, disable the Entra account of every non-whitelisted user via Microsoft Graph (requires User.EnableDisableAccount.All + User.Read.All)",
+            "type": "boolean",
+            "multi": false,
+            "required": false,
+            "defaultValue": false
+        },
+        {
+            "name": "Force password reset on true positive",
+            "description": "On true-positive, force a password change at next sign-in for every non-whitelisted user via Microsoft Graph (requires User.ReadWrite.All)",
+            "type": "boolean",
+            "multi": false,
+            "required": false,
+            "defaultValue": false
+        },
+        {
+            "name": "Revoke sessions on true positive",
+            "description": "On true-positive, revoke all active sign-in sessions (refresh tokens + session cookies) for every non-whitelisted user via Microsoft Graph (requires User.RevokeSessions.All or User.ReadWrite.All)",
+            "type": "boolean",
+            "multi": false,
+            "required": false,
+            "defaultValue": false
+        },
+        {
+            "name": "Isolate device on true positive",
+            "description": "On true-positive, isolate every non-whitelisted source device via Microsoft Defender for Endpoint",
+            "type": "boolean",
+            "multi": false,
+            "required": false,
+            "defaultValue": false
+        },
+        {
+            "name": "Full isolation",
+            "description": "Isolation scope when 'Isolate device on true positive' is enabled: False (default, recommended) = Selective; True = Full network isolation",
+            "type": "boolean",
+            "multi": false,
+            "required": false,
+            "defaultValue": false
+        },
+        {
+            "name": "TheHive public URL",
+            "description": "Browser-reachable base URL of TheHive (e.g. https://<gw_fqdn>/<namespace>/thehive). Used to build the USM ticket's customerRef link to the case. Required only if 'Create USM ticket on true positive' is enabled",
+            "type": "string",
+            "multi": false,
+            "required": false,
+            "defaultValue": ""
+        },
+        {
+            "name": "Create USM ticket on true positive",
+            "description": "On true-positive, create a USM (service-desk) ticket for the case. The job fails if creation is enabled and the ticket cannot be created; an already-existing ticket (same customerRef) is not a failure",
+            "type": "boolean",
+            "multi": false,
+            "required": false,
+            "defaultValue": false
+        },
+        {
+            "name": "USM URL",
+            "description": "USM service-desk API base URL (e.g. https://test-servicedesk.example.com). Required only if 'Create USM ticket on true positive' is enabled",
+            "type": "string",
+            "multi": false,
+            "required": false,
+            "defaultValue": ""
+        },
+        {
+            "name": "USM API key",
+            "description": "USM API key (sent as the 'apiKey' header). Required only if 'Create USM ticket on true positive' is enabled",
+            "type": "string",
+            "multi": false,
+            "required": false,
+            "defaultValue": ""
+        },
+        {
+            "name": "Update USM ticket on case reevaluation",
+            "description": "On true-positive, if a USM ticket already exists for the case, update its description and status (best-effort: an update failure is logged but does not fail the job)",
+            "type": "boolean",
+            "multi": false,
+            "required": false,
+            "defaultValue": false
+        }
+    ]
+}

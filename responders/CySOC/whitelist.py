@@ -16,6 +16,10 @@ device ids makes every spelling of the same user/host (SAM name, UPN, mail,
 short hostname, FQDN, IP) map to the same entry. Writes are merged into the
 document with Consul check-and-set (cas=<ModifyIndex>) and retried on
 conflict, since the document is now a single resource shared by every write.
+
+The generic observable/taxonomy helpers and host (device) resolution live in
+``observables.py`` and are shared with the malware responder; they are
+re-exported here for backwards compatibility.
 """
 import base64
 from typing import Optional
@@ -23,11 +27,21 @@ from typing import Optional
 import requests
 import yaml
 
-HOST_DATA_TYPES = ("hostname", "ip", "fqdn")
+from observables import (
+    DEVICE_ID_PREDICATES,
+    HOST_DATA_TYPES,
+    has_role_tags,
+    is_destination,
+    is_mde_not_found,
+    resolve_candidates,
+    resolve_hosts,
+    select_candidates,
+    taxonomy_value,
+)
+
 USER_DATA_TYPES = ("username", "mail")
 
-# Taxonomy predicates produced by the MicrosoftDefender enrichment analyzers
-DEVICE_ID_PREDICATES = ("Device_ID",)
+# Taxonomy predicates produced by the MicrosoftDefender user enrichment analyzer
 USER_ID_PREDICATES = ("Account_Object_ID", "OnPrem_Object_ID")
 # Supplementary user ids carried alongside the canonical user id, so containment can pick the right
 # Graph/Defender action per identity type (Entra cloud-only vs on-prem/hybrid AD password reset).
@@ -39,32 +53,27 @@ IDENTITY_ACCOUNT_ID_PREDICATES = ("Identity_Account_ID",)
 # is still labelled with its UPN instead of the GUID. Matching is unaffected (it uses the canonical id).
 USER_DISPLAY_PREDICATES = ("UPN", "Display_Name")
 
-# Observables created by enrichment analyzers carry this tag; they are
-# by-products of the investigation, not the DCSync source host/account.
-ARTIFACT_TAG_PREFIX = "MicrosoftDefender"
-
-# Role tags attached by SOAR (StackStorm) from the Defender alert evidence roles
-# (tag spelling "MDE:Role=<role>"; compared lower-cased). They identify the
-# destination of the replication request — the attacked DC — which must never
-# enter a whitelist pair. Untagged observables are treated as source.
-ROLE_TAG_PREFIX = "mde:role="
-ROLE_TAG_DESTINATION = "mde:role=destination"
-
-# Mini-report taxonomy emitted by the MicrosoftDefender analyzers marking an
-# observable that was looked up but is absent from MDE. Its value is null, so it
-# is detected by predicate presence (taxonomy_value can't see a null value). The
-# tag spelling is tolerated too, in case the chip is mirrored as an observable tag.
-MDE_NAMESPACE = "MDE"
-NOT_FOUND_PREDICATE = "Not_Found"
-NOT_FOUND_TAG = "mde:not_found"
-
-
-class ConsulKVError(Exception):
-    """Raised when Consul KV cannot be read or written."""
+# Re-exported generic helpers — kept here so existing imports `from whitelist import ...` keep working.
+__all__ = [
+    "ConsulKVError",
+    "ConsulWhitelist",
+    "PairResolver",
+    "pair_key",
+    "select_candidates",
+    "taxonomy_value",
+    "is_destination",
+    "has_role_tags",
+    "is_mde_not_found",
+    "resolve_hosts",
+]
 
 
 def pair_key(user_id: str, device_id: str) -> str:
     return f"{user_id.strip().lower()}:{device_id.strip().lower()}"
+
+
+class ConsulKVError(Exception):
+    """Raised when Consul KV cannot be read or written."""
 
 
 class ConsulWhitelist:
@@ -114,48 +123,6 @@ class ConsulWhitelist:
         self._cas_update(lambda entries: entries.__setitem__(key, metadata))
 
 
-def select_candidates(observables: list, data_types: tuple, ignore_tag_prefix: str = ARTIFACT_TAG_PREFIX) -> list:
-    return [
-        obs
-        for obs in observables
-        if obs.get("dataType") in data_types
-        and not any(tag.startswith(ignore_tag_prefix) for tag in obs.get("tags", []))
-    ]
-
-
-def taxonomy_value(observable: dict, predicates: tuple) -> Optional[str]:
-    """Extract a taxonomy value from the observable's analyzer reports, honoring predicate priority."""
-    for predicate in predicates:
-        for report in (observable.get("reports") or {}).values():
-            for taxonomy in report.get("taxonomies") or []:
-                if taxonomy.get("predicate") == predicate and taxonomy.get("value"):
-                    return str(taxonomy["value"])
-    return None
-
-
-def is_destination(observable: dict) -> bool:
-    """True if the observable is explicitly tagged as the replication destination (attacked DC)."""
-    return any(tag.lower() == ROLE_TAG_DESTINATION for tag in observable.get("tags", []))
-
-
-def has_role_tags(candidates: list) -> bool:
-    """True if any candidate carries an mde:role= tag (in either source or destination form)."""
-    return any(tag.lower().startswith(ROLE_TAG_PREFIX) for obs in candidates for tag in obs.get("tags", []))
-
-
-def is_mde_not_found(observable: dict) -> bool:
-    """True if the observable was looked up by MDE but is absent (MDE:Not_Found).
-
-    The Not_Found taxonomy carries a null value, so it's detected by predicate presence rather than
-    taxonomy_value (which requires a truthy value). An observable-tag spelling is honored too.
-    """
-    for report in (observable.get("reports") or {}).values():
-        for taxonomy in report.get("taxonomies") or []:
-            if taxonomy.get("namespace") == MDE_NAMESPACE and taxonomy.get("predicate") == NOT_FOUND_PREDICATE:
-                return True
-    return any(tag.lower().replace(" ", "") == NOT_FOUND_TAG for tag in observable.get("tags", []))
-
-
 class PairResolver:
     """Resolve case observables to canonical (user, host) pairs.
 
@@ -189,8 +156,8 @@ class PairResolver:
         host_candidates = select_candidates(observables, HOST_DATA_TYPES)
         user_candidates = select_candidates(observables, USER_DATA_TYPES)
         role_tags_used = has_role_tags(host_candidates) or has_role_tags(user_candidates)
-        hosts = self._resolve_candidates(host_candidates, DEVICE_ID_PREDICATES, unresolved)
-        users = self._resolve_candidates(
+        hosts = resolve_candidates(host_candidates, DEVICE_ID_PREDICATES, unresolved)
+        users = resolve_candidates(
             user_candidates,
             USER_ID_PREDICATES,
             unresolved,
@@ -219,65 +186,3 @@ class PairResolver:
         ]
         selection = "source-role-tags" if role_tags_used else "all-candidates"
         return pairs, unresolved, selection
-
-    def _resolve_candidates(
-        self, candidates: list, predicates: tuple, unresolved: list, extra_ids: dict = None,
-        display_predicates: tuple = None,
-    ) -> list:
-        """Resolve candidates to canonical-id entries, excluding destination identities.
-
-        Two passes: the first collects the canonical ids of destination-tagged observables (which never
-        need enrichment and are never sources); the second resolves the remaining observables and drops
-        any whose canonical id matched a destination — so a destination DC tagged only on its hostname
-        also excludes its untagged, same-machine ip.
-
-        When display_predicates is given, the entry's "data" (its human-readable label) is taken from the
-        first matching enrichment taxonomy (e.g. UPN, then Display_Name), falling back to the observable's
-        own data when none is present — so a friendlier name is used whenever the analyzer resolved one.
-        """
-        destination_ids = set()
-        sources = []  # (obs, data, matched_predicate, canonical) for non-destination candidates
-        for obs in candidates:
-            data = (obs.get("data") or "").strip()
-            matched_predicate, canonical = self._first_taxonomy_match(obs, predicates)
-            if is_destination(obs):
-                if canonical:
-                    destination_ids.add(canonical.lower())
-                continue
-            sources.append((obs, data, matched_predicate, canonical))
-
-        resolved = []
-        seen_ids = set()
-        for obs, data, matched_predicate, canonical in sources:
-            if canonical:
-                canonical_id = canonical.lower()
-                if canonical_id in destination_ids:
-                    continue  # same device/user as a destination-tagged observable
-                if canonical_id not in seen_ids:
-                    seen_ids.add(canonical_id)
-                    display = taxonomy_value(obs, display_predicates) if display_predicates else None
-                    entry = {"data": display or data, "id": canonical, "id_predicate": matched_predicate}
-                    for field, field_predicates in (extra_ids or {}).items():
-                        entry[field] = taxonomy_value(obs, field_predicates)
-                    resolved.append(entry)
-            elif is_mde_not_found(obs):
-                continue  # looked up by MDE but absent — ignore, don't block the job
-            else:
-                unresolved.append(
-                    {
-                        "data": data,
-                        "dataType": obs.get("dataType", ""),
-                        "reason": "no MDE enrichment report — run the MicrosoftDefender analyzer "
-                        "(Not_Found observables are skipped, not unresolved)",
-                    }
-                )
-        return resolved
-
-    @staticmethod
-    def _first_taxonomy_match(observable: dict, predicates: tuple) -> tuple:
-        """Like taxonomy_value, but also returns which predicate matched (priority order)."""
-        for predicate in predicates:
-            value = taxonomy_value(observable, (predicate,))
-            if value:
-                return predicate, value
-        return None, None
