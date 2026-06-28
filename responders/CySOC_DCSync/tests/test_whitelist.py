@@ -39,6 +39,11 @@ def ip_host_obs(data="10.0.0.5", device_id=DEVICE_ID, tags=()):
     return observable("ip", data, tags=tags, reports=reports)
 
 
+def fqdn_host_obs(data="ws01.socdev.lan", device_id=DEVICE_ID, tags=()):
+    reports = {"MicrosoftDefender_GetDeviceInfo_1_0": {"taxonomies": [{"predicate": "Device_ID", "value": device_id}]}}
+    return observable("fqdn", data, tags=tags, reports=reports)
+
+
 def mail_user_obs(data="svc-sync@socdev.lan", user_id=USER_GUID, tags=()):
     reports = {"MicrosoftDefender_GetUserInfo_1_0": {"taxonomies": [{"predicate": "Account_Object_ID", "value": user_id}]}}
     return observable("mail", data, tags=tags, reports=reports)
@@ -261,6 +266,35 @@ def test_resolve_deduplicates_hostname_and_ip_same_device():
     pairs, unresolved, _ = PairResolver().resolve(observables)
     assert unresolved == []
     assert len(pairs) == 1
+
+
+def test_resolve_pairs_from_fqdn_host():
+    # a host present only as an fqdn resolves to a device (via its Device_ID) and pairs with a user
+    pairs, unresolved, _ = PairResolver().resolve([fqdn_host_obs("ws01.socdev.lan", DEVICE_ID), user_obs()])
+    assert unresolved == []
+    assert len(pairs) == 1
+    assert pairs[0]["device_id"] == DEVICE_ID
+    assert pairs[0]["host"] == "ws01.socdev.lan"
+
+
+def test_resolve_deduplicates_hostname_and_fqdn_same_device():
+    # same machine seen as hostname + fqdn collapses to one device (canonical Device_ID)
+    observables = [host_obs("ws01", DEVICE_ID), fqdn_host_obs("ws01.socdev.lan", DEVICE_ID), user_obs()]
+    pairs, unresolved, _ = PairResolver().resolve(observables)
+    assert unresolved == []
+    assert len(pairs) == 1
+
+
+def test_resolve_destination_fqdn_excludes_same_device():
+    # a DC tagged destination on its fqdn excludes its untagged same-device hostname too
+    observables = [
+        fqdn_host_obs("dc01.socdev.lan", DEVICE_ID, tags=["MDE:Role=destination"]),
+        host_obs("dc01", DEVICE_ID),
+        user_obs(tags=["MDE:Role=source"]),
+    ]
+    pairs, unresolved, _ = PairResolver().resolve(observables)
+    assert unresolved == []
+    assert pairs == []
 
 
 def consul_item(key, entries, modify_index=1):

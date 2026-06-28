@@ -23,7 +23,7 @@ from typing import Optional
 import requests
 import yaml
 
-HOST_DATA_TYPES = ("hostname", "ip")
+HOST_DATA_TYPES = ("hostname", "ip", "fqdn")
 USER_DATA_TYPES = ("username", "mail")
 
 # Taxonomy predicates produced by the MicrosoftDefender enrichment analyzers
