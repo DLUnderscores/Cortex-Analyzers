@@ -148,26 +148,34 @@ class CySOCResponder(Responder):
             desc = f"{desc}\n\nContainment actions taken:\n" + "\n".join(lines)
         return desc
 
-    def _lookup_ticket_no(self, usm, customer_ref):
+    def _lookup_ticket_no(self, usm, customer_ref, thehive, case_id):
         """Best-effort resolve of the ticket number for a customerRef.
 
         The number is reporting metadata, not a gate: a lookup failure must never fail the job
         (for the create path, the ticket already exists; the only fatal USM gate is creation
-        itself). Returns the ticket number or None.
+        itself). Returns the ticket number or None. The reason it could not be resolved (an error,
+        or simply no match) is logged to the CySOC/Log task so a null ``ticket_no`` is diagnosable
+        rather than silent.
         """
+        prefix = self._log_prefix()
         try:
-            return usm.find_ticket_no(customer_ref)
-        except USMError:
+            ticket_no = usm.find_ticket_no(customer_ref)
+        except USMError as exc:
+            self._log(thehive, case_id, f"{prefix}: USM ticket number lookup failed — {exc}")
             return None
+        if not ticket_no:
+            self._log(
+                thehive, case_id, f"{prefix}: USM ticket number not found for customerRef {customer_ref}"
+            )
+        return ticket_no
 
     def _handle_usm(self, thehive, case, case_id, actions):
         """Create (or, on reevaluation, update) a USM ticket for a true-positive case.
 
         No-op unless 'Create USM ticket on true positive' is enabled (returns None). Otherwise
-        returns a dict ``{"status", "ticket_no", "case_url"}`` recording the outcome for the JSON
-        report — ``status`` is "created" or "exists", ``ticket_no`` is the resolved USM ticket
-        number (best-effort; None if it could not be looked up), and ``case_url`` is the
-        browser-reachable TheHive case deep link the ticket references.
+        returns a dict ``{"status", "ticketno"}`` recording the outcome for the JSON report —
+        ``status`` is "created" or "exists" and ``ticket_no`` is the resolved USM ticket number
+        (best-effort; None if it could not be looked up).
 
         Creation failure fails the job (the only USM failure that does); a customerRef that already
         exists is benign and, when 'Update USM ticket on case reevaluation' is enabled, the existing
@@ -182,17 +190,20 @@ class CySOCResponder(Responder):
         desc = self._build_usm_desc(case, actions)
         severity = self._usm_severity(case.get("severity"))
         try:
-            result = usm.create_ticket(title, desc, severity, customer_ref)
+            result, ticket_no = usm.create_ticket(title, desc, severity, customer_ref)
         except USMError as exc:
             self._fail(thehive, case_id, f"USM ticket creation failed: {exc}")
             return None  # unreachable — _fail exits — but keeps the contract explicit
         if result == "created":
-            ticket_no = self._lookup_ticket_no(usm, customer_ref)
+            # The create response usually echoes the new ticket number; only fall back to a
+            # readall lookup if it didn't (e.g. an older API shape).
+            if not ticket_no:
+                ticket_no = self._lookup_ticket_no(usm, customer_ref, thehive, case_id)
             suffix = f" (ticket {ticket_no})" if ticket_no else ""
             self._log(thehive, case_id, f"{prefix}: USM ticket created — {customer_ref}{suffix}")
-            return {"status": "created", "ticket_no": ticket_no, "case_url": customer_ref}
-        # result == "exists": the case already has a ticket
-        ticket_no = self._lookup_ticket_no(usm, customer_ref)
+            return {"status": "created", "ticketno": ticket_no}
+        # result == "exists": the case already has a ticket — resolve its number by lookup
+        ticket_no = self._lookup_ticket_no(usm, customer_ref, thehive, case_id)
         if self.update_usm_ticket_on_reeval:
             try:
                 if ticket_no:
@@ -208,4 +219,4 @@ class CySOCResponder(Responder):
                 self._log(thehive, case_id, f"{prefix}: FAILED to update existing USM ticket — {exc}")
         else:
             self._log(thehive, case_id, f"{prefix}: USM ticket already exists — update disabled, skipped")
-        return {"status": "exists", "ticket_no": ticket_no, "case_url": customer_ref}
+        return {"status": "exists", "ticketno": ticket_no}
