@@ -128,6 +128,23 @@ class MicrosoftDefenderAnalyzer(Analyzer):
     # Device search strategies
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _best_machine(machines: list) -> Optional[dict]:
+        """Pick the most authoritative record when a filter matches several machines.
+
+        MDE frequently holds duplicate records for one host: a fully onboarded agent record
+        plus an unmanaged Device Discovery phantom (onboardingStatus 'InsufficientInfo',
+        DeviceType 'Unknown') that shares the same lastIpAddress. Prefer an 'Onboarded'
+        record, then the most recently seen, so an IP shared by a phantom and the real device
+        resolves to the real device instead of an arbitrary value[0].
+        """
+        if not machines:
+            return None
+        onboarded = [m for m in machines if m.get("onboardingStatus") == "Onboarded"]
+        candidates = onboarded or machines
+        # ISO 8601 timestamps sort lexically, so the max string is the most recent lastSeen.
+        return max(candidates, key=lambda m: m.get("lastSeen") or "")
+
     def _search_machine(self, observable: str) -> Optional[dict]:
         safe = observable.lower().replace("'", "''")
         is_ip = bool(IPV4_RE.match(observable)) or self.data_type == "ip"
@@ -135,23 +152,23 @@ class MicrosoftDefenderAnalyzer(Analyzer):
 
         # Strategy 1: exact computerDnsName match
         data = self._get("machines", params={"$filter": f"computerDnsName eq '{safe}'"})
-        machines = data.get("value", [])
-        if machines:
-            return machines[0]
+        machine = self._best_machine(data.get("value", []))
+        if machine:
+            return machine
 
         # Strategy 2: lastIpAddress match (IP inputs)
         if is_ip:
             data = self._get("machines", params={"$filter": f"lastIpAddress eq '{safe}'"})
-            machines = data.get("value", [])
-            if machines:
-                return machines[0]
+            machine = self._best_machine(data.get("value", []))
+            if machine:
+                return machine
 
         # Strategy 3: startswith match for short hostnames
         if is_short:
             data = self._get("machines", params={"$filter": f"startswith(computerDnsName,'{safe}')"})
-            machines = data.get("value", [])
-            if machines:
-                return machines[0]
+            machine = self._best_machine(data.get("value", []))
+            if machine:
+                return machine
 
         return None
 
