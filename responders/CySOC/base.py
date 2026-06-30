@@ -148,13 +148,30 @@ class CySOCResponder(Responder):
             desc = f"{desc}\n\nContainment actions taken:\n" + "\n".join(lines)
         return desc
 
+    def _lookup_ticket_no(self, usm, customer_ref):
+        """Best-effort resolve of the ticket number for a customerRef.
+
+        The number is reporting metadata, not a gate: a lookup failure must never fail the job
+        (for the create path, the ticket already exists; the only fatal USM gate is creation
+        itself). Returns the ticket number or None.
+        """
+        try:
+            return usm.find_ticket_no(customer_ref)
+        except USMError:
+            return None
+
     def _handle_usm(self, thehive, case, case_id, actions):
         """Create (or, on reevaluation, update) a USM ticket for a true-positive case.
 
-        No-op unless 'Create USM ticket on true positive' is enabled. Creation failure fails the
-        job (the only USM failure that does); a customerRef that already exists is benign and, when
-        'Update USM ticket on case reevaluation' is enabled, the existing ticket is updated
-        best-effort (an update failure is logged, not fatal).
+        No-op unless 'Create USM ticket on true positive' is enabled (returns None). Otherwise
+        returns a dict ``{"status", "ticket_no", "case_url"}`` recording the outcome for the JSON
+        report — ``status`` is "created" or "exists", ``ticket_no`` is the resolved USM ticket
+        number (best-effort; None if it could not be looked up), and ``case_url`` is the
+        browser-reachable TheHive case deep link the ticket references.
+
+        Creation failure fails the job (the only USM failure that does); a customerRef that already
+        exists is benign and, when 'Update USM ticket on case reevaluation' is enabled, the existing
+        ticket is updated best-effort (an update failure is logged, not fatal).
         """
         if not self.create_usm_ticket_on_tp:
             return None
@@ -170,12 +187,14 @@ class CySOCResponder(Responder):
             self._fail(thehive, case_id, f"USM ticket creation failed: {exc}")
             return None  # unreachable — _fail exits — but keeps the contract explicit
         if result == "created":
-            self._log(thehive, case_id, f"{prefix}: USM ticket created — {customer_ref}")
-            return "created"
+            ticket_no = self._lookup_ticket_no(usm, customer_ref)
+            suffix = f" (ticket {ticket_no})" if ticket_no else ""
+            self._log(thehive, case_id, f"{prefix}: USM ticket created — {customer_ref}{suffix}")
+            return {"status": "created", "ticket_no": ticket_no, "case_url": customer_ref}
         # result == "exists": the case already has a ticket
+        ticket_no = self._lookup_ticket_no(usm, customer_ref)
         if self.update_usm_ticket_on_reeval:
             try:
-                ticket_no = usm.find_ticket_no(customer_ref)
                 if ticket_no:
                     usm.update_ticket(ticket_no, desc)
                     self._log(thehive, case_id, f"{prefix}: USM ticket {ticket_no} updated")
@@ -189,4 +208,4 @@ class CySOCResponder(Responder):
                 self._log(thehive, case_id, f"{prefix}: FAILED to update existing USM ticket — {exc}")
         else:
             self._log(thehive, case_id, f"{prefix}: USM ticket already exists — update disabled, skipped")
-        return "exists"
+        return {"status": "exists", "ticket_no": ticket_no, "case_url": customer_ref}

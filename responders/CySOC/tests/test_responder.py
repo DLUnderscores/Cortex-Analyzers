@@ -120,11 +120,14 @@ class StubDefender:
 
 
 class StubUSM:
-    def __init__(self, create_result="created", ticket_no="IN-0005702", fail_create=False, fail_update=False):
+    def __init__(
+        self, create_result="created", ticket_no="IN-0005702", fail_create=False, fail_update=False, fail_lookup=False
+    ):
         self.create_result = create_result
         self.ticket_no = ticket_no
         self.fail_create = fail_create
         self.fail_update = fail_update
+        self.fail_lookup = fail_lookup
         self.created = []  # (title, desc, severity, customer_ref)
         self.updated = []  # (ticket_no, desc)
         self.lookups = []  # customer_ref
@@ -137,6 +140,8 @@ class StubUSM:
 
     def find_ticket_no(self, customer_ref):
         self.lookups.append(customer_ref)
+        if self.fail_lookup:
+            raise USMError("lookup failed")
         return self.ticket_no
 
     def update_ticket(self, ticket_no, desc, status="IN_CRE"):
@@ -371,11 +376,29 @@ def test_check_tp_creates_usm_ticket(tmp_path):
     output = run_responder(tmp_path, thehive, StubWhitelist(), usm=usm)
 
     assert output["full"]["verdict"] == "true-positive"
-    assert output["full"]["usm"] == "created"
+    assert output["full"]["usm"] == {
+        "status": "created",
+        "ticket_no": "IN-0005702",
+        "case_url": EXPECTED_CUSTOMER_REF,
+    }
+    # the ticket number is looked up after creation so it can be reported
+    assert usm.lookups == [EXPECTED_CUSTOMER_REF]
     # title is prefixed with the TheHive case number (CASE.caseId == 42);
     # severity 4 (Critical) inverts to USM "1"; desc is the case description (no containment actions)
     assert usm.created == [("Case #42 - DCSync attack detected", "case body", "1", EXPECTED_CUSTOMER_REF)]
-    assert any("USM ticket created" in log[3] for log in thehive.logs)
+    assert any("USM ticket created" in log[3] and "IN-0005702" in log[3] for log in thehive.logs)
+    assert thehive.closed[0] == ("~4128", "true-positive")
+
+
+def test_check_tp_usm_ticket_no_lookup_failure_is_not_fatal(tmp_path):
+    write_job(tmp_path, "check", case=USM_CASE, config_overrides=USM_ENABLED)
+    thehive = StubTheHive(OBSERVABLES)
+    usm = StubUSM(create_result="created", fail_lookup=True)
+    output = run_responder(tmp_path, thehive, StubWhitelist(), usm=usm)
+
+    # creation succeeded; only the (best-effort) number lookup failed — job still succeeds and closes
+    assert output["success"] is True
+    assert output["full"]["usm"] == {"status": "created", "ticket_no": None, "case_url": EXPECTED_CUSTOMER_REF}
     assert thehive.closed[0] == ("~4128", "true-positive")
 
 
@@ -411,7 +434,11 @@ def test_check_existing_usm_ticket_updated_on_reeval(tmp_path):
     usm = StubUSM(create_result="exists", ticket_no="IN-0005702")
     output = run_responder(tmp_path, thehive, StubWhitelist(), usm=usm)
 
-    assert output["full"]["usm"] == "exists"
+    assert output["full"]["usm"] == {
+        "status": "exists",
+        "ticket_no": "IN-0005702",
+        "case_url": EXPECTED_CUSTOMER_REF,
+    }
     assert usm.lookups == [EXPECTED_CUSTOMER_REF]
     assert usm.updated == [("IN-0005702", "case body")]
     assert any("IN-0005702 updated" in log[3] for log in thehive.logs)
@@ -423,9 +450,14 @@ def test_check_existing_usm_ticket_skipped_when_update_disabled(tmp_path):
     usm = StubUSM(create_result="exists")
     output = run_responder(tmp_path, thehive, StubWhitelist(), usm=usm)
 
-    assert output["full"]["usm"] == "exists"
+    assert output["full"]["usm"] == {
+        "status": "exists",
+        "ticket_no": "IN-0005702",
+        "case_url": EXPECTED_CUSTOMER_REF,
+    }
     assert usm.updated == []
-    assert usm.lookups == []
+    # the number is still looked up (for the report) even though the update is disabled
+    assert usm.lookups == [EXPECTED_CUSTOMER_REF]
     assert any("update disabled" in log[3] for log in thehive.logs)
 
 
@@ -437,7 +469,11 @@ def test_check_usm_update_failure_is_not_fatal(tmp_path):
     output = run_responder(tmp_path, thehive, StubWhitelist(), usm=usm)
 
     assert output["success"] is True
-    assert output["full"]["usm"] == "exists"
+    assert output["full"]["usm"] == {
+        "status": "exists",
+        "ticket_no": "IN-0005702",
+        "case_url": EXPECTED_CUSTOMER_REF,
+    }
     assert thehive.closed[0] == ("~4128", "true-positive")
     assert any("FAILED to update existing USM ticket" in log[3] for log in thehive.logs)
 
@@ -462,7 +498,11 @@ def test_check_whitelist_not_configured_creates_usm_ticket(tmp_path):
 
     assert output["full"]["verdict"] == "true-positive"
     assert output["full"]["case_closed"] is False  # left open for manual review
-    assert output["full"]["usm"] == "created"
+    assert output["full"]["usm"] == {
+        "status": "created",
+        "ticket_no": "IN-0005702",
+        "case_url": EXPECTED_CUSTOMER_REF,
+    }
     assert len(usm.created) == 1
 
 
