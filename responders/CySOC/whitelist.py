@@ -28,12 +28,12 @@ import requests
 import yaml
 
 from observables import (
-    DEVICE_ID_PREDICATES,
     HOST_DATA_TYPES,
     has_role_tags,
     is_destination,
     is_mde_not_found,
     resolve_candidates,
+    resolve_devices,
     resolve_hosts,
     select_candidates,
     taxonomy_value,
@@ -64,6 +64,7 @@ __all__ = [
     "is_destination",
     "has_role_tags",
     "is_mde_not_found",
+    "resolve_devices",
     "resolve_hosts",
 ]
 
@@ -156,7 +157,7 @@ class PairResolver:
         host_candidates = select_candidates(observables, HOST_DATA_TYPES)
         user_candidates = select_candidates(observables, USER_DATA_TYPES)
         role_tags_used = has_role_tags(host_candidates) or has_role_tags(user_candidates)
-        hosts = resolve_candidates(host_candidates, DEVICE_ID_PREDICATES, unresolved)
+        hosts = resolve_devices(host_candidates, unresolved)
         users = resolve_candidates(
             user_candidates,
             USER_ID_PREDICATES,

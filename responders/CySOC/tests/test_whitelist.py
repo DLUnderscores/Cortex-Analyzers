@@ -9,12 +9,31 @@ from whitelist import (
     ConsulWhitelist,
     PairResolver,
     pair_key,
+    resolve_hosts,
     select_candidates,
     taxonomy_value,
 )
 
 USER_GUID = "11111111-2222-3333-4444-555555555555"
 DEVICE_ID = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+# A Device Discovery 'InsufficientInfo' phantom that an older analyzer enriched onto an ip observable,
+# sharing the real device's internal IP. PHANTOM_ID is the canonical Device_ID of that bogus record.
+PHANTOM_ID = "0281375d891b3feab952ed7d5a1d28605599f308"
+SHARED_INTERNAL_IP = "192.168.20.109"
+
+
+def device_obs(data_type, data, device_id, onboarding="Onboarded", internal_ip=SHARED_INTERNAL_IP,
+               last_seen=None, tags=()):
+    """Host observable enriched with the supplementary device taxonomies used for internal-IP dedup."""
+    taxonomies = [{"predicate": "Device_ID", "value": device_id}]
+    if onboarding is not None:
+        taxonomies.append({"predicate": "Onboarding_Status", "value": onboarding})
+    if internal_ip is not None:
+        taxonomies.append({"predicate": "Last_Internal_IP", "value": internal_ip})
+    if last_seen is not None:
+        taxonomies.append({"predicate": "Last_Seen", "value": last_seen})
+    reports = {"MicrosoftDefender_GetDeviceInfo_1_0": {"taxonomies": taxonomies}}
+    return observable(data_type, data, tags=tags, reports=reports)
 
 
 def observable(data_type, data, tags=(), reports=None):
@@ -295,6 +314,73 @@ def test_resolve_destination_fqdn_excludes_same_device():
     pairs, unresolved, _ = PairResolver().resolve(observables)
     assert unresolved == []
     assert pairs == []
+
+
+def test_resolve_hosts_collapses_phantom_sharing_internal_ip():
+    # Older enrichment: ip observable carries the Discovery phantom, hostname the real onboarded device.
+    # Both share the internal IP, so they collapse to the single authoritative (Onboarded) record.
+    observables = [
+        device_obs("ip", SHARED_INTERNAL_IP, PHANTOM_ID, onboarding="InsufficientInfo"),
+        device_obs("hostname", "win-lab-clt-04.socdev.lan", DEVICE_ID, onboarding="Onboarded"),
+    ]
+    devices, unresolved = resolve_hosts(observables)
+    assert unresolved == []
+    assert [d["id"] for d in devices] == [DEVICE_ID]
+
+
+def test_resolve_hosts_phantom_first_still_keeps_onboarded():
+    # Order-independent: even when the phantom is encountered first, the onboarded record wins.
+    observables = [
+        device_obs("hostname", "win-lab-clt-04.socdev.lan", PHANTOM_ID, onboarding="InsufficientInfo"),
+        device_obs("ip", SHARED_INTERNAL_IP, DEVICE_ID, onboarding="Onboarded"),
+    ]
+    devices, _ = resolve_hosts(observables)
+    assert [d["id"] for d in devices] == [DEVICE_ID]
+
+
+def test_resolve_hosts_different_internal_ips_not_collapsed():
+    # Two genuinely distinct devices with different internal IPs are never merged.
+    observables = [
+        device_obs("hostname", "ws01", DEVICE_ID, internal_ip="10.0.0.5"),
+        device_obs("ip", "10.0.0.6", PHANTOM_ID, internal_ip="10.0.0.6"),
+    ]
+    devices, _ = resolve_hosts(observables)
+    assert {d["id"] for d in devices} == {DEVICE_ID, PHANTOM_ID}
+
+
+def test_resolve_hosts_same_ip_breaks_tie_on_last_seen():
+    # Two onboarded records sharing an IP (no phantom) collapse to the most recently seen.
+    older = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f60000"
+    observables = [
+        device_obs("hostname", "ws01", older, last_seen="2025-01-01T00:00:00.0000000Z"),
+        device_obs("ip", SHARED_INTERNAL_IP, DEVICE_ID, last_seen="2026-06-29T15:20:12.2844153Z"),
+    ]
+    devices, _ = resolve_hosts(observables)
+    assert [d["id"] for d in devices] == [DEVICE_ID]
+
+
+def test_resolve_hosts_entries_without_internal_ip_not_collapsed():
+    # Backwards-compat: when reports lack Last_Internal_IP, only canonical-Device_ID dedup applies,
+    # so two distinct ids stay distinct.
+    observables = [
+        device_obs("hostname", "ws01", DEVICE_ID, internal_ip=None),
+        device_obs("ip", "10.0.0.9", PHANTOM_ID, internal_ip=None),
+    ]
+    devices, _ = resolve_hosts(observables)
+    assert {d["id"] for d in devices} == {DEVICE_ID, PHANTOM_ID}
+
+
+def test_resolve_dcsync_pairs_ignore_phantom_device():
+    # The DCSync pairing path (PairResolver) consumes the same dedup: a user pairs only with the
+    # real device, not the phantom — so a stale phantom can't create a spurious second pair.
+    observables = [
+        device_obs("ip", SHARED_INTERNAL_IP, PHANTOM_ID, onboarding="InsufficientInfo"),
+        device_obs("hostname", "win-lab-clt-04.socdev.lan", DEVICE_ID, onboarding="Onboarded"),
+        user_obs(),
+    ]
+    pairs, unresolved, _ = PairResolver().resolve(observables)
+    assert unresolved == []
+    assert [p["device_id"] for p in pairs] == [DEVICE_ID]
 
 
 def consul_item(key, entries, modify_index=1):
