@@ -88,6 +88,33 @@ def test_close_case_indeterminate_raises_on_error(fake_http):
         client.close_case_indeterminate(CASE_ID)
 
 
+def test_add_case_tags_merges_with_existing_tags(fake_http):
+    fake_http.route("PATCH", f"/api/case/{CASE_ID}", FakeResponse(200, {}))
+    client = TheHiveClient("http://thehive", "key", http=fake_http)
+
+    client.add_case_tags(CASE_ID, ["Verdict:Inconclusive"], ["MDE:EvidenceVerdict=suspicious"])
+
+    assert fake_http.calls[-1]["json"] == {
+        "tags": ["MDE:EvidenceVerdict=suspicious", "Verdict:Inconclusive"]
+    }
+
+
+def test_add_case_tags_is_a_noop_when_already_present(fake_http):
+    client = TheHiveClient("http://thehive", "key", http=fake_http)
+
+    client.add_case_tags(CASE_ID, ["Verdict:Inconclusive"], ["Verdict:Inconclusive", "tlp:amber"])
+
+    assert fake_http.calls == []
+
+
+def test_add_case_tags_raises_on_error(fake_http):
+    fake_http.route("PATCH", f"/api/case/{CASE_ID}", FakeResponse(500, text="boom"))
+    client = TheHiveClient("http://thehive", "key", http=fake_http)
+
+    with pytest.raises(TheHiveError):
+        client.add_case_tags(CASE_ID, ["Verdict:Inconclusive"])
+
+
 def test_create_task_completes_it_immediately(fake_http):
     fake_http.route("POST", f"/api/case/{CASE_ID}/task", FakeResponse(201, {"_id": TASK_ID}))
     fake_http.route("PATCH", f"/api/case/task/{TASK_ID}", FakeResponse(200, {}))

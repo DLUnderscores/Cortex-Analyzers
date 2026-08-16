@@ -102,6 +102,29 @@ class TheHiveClient:
                     f"Failed to close case {case_id} as Indeterminate: HTTP {resp.status_code} — {resp.text}"
                 )
 
+    def add_case_tags(self, case_id: str, tags: list, existing_tags=()) -> None:
+        """Add tags to a case, keeping the ones it already carries.
+
+        TheHive's case PATCH replaces the whole tag list, so the merge happens here: the caller
+        passes the case's current tags (the responder is handed them with the case object).
+        No-op when every tag is already present.
+        """
+        merged = list(existing_tags or [])
+        added = [tag for tag in tags if tag not in merged]
+        if not added:
+            return
+        resp = self.http.patch(
+            f"{self.url}/api/case/{case_id}",
+            headers=self.headers,
+            json={"tags": merged + added},
+            verify=self.verify,
+            timeout=30,
+        )
+        if not (200 <= resp.status_code < 300):
+            raise TheHiveError(
+                f"Failed to tag case {case_id} with {added}: HTTP {resp.status_code} — {resp.text}"
+            )
+
     def get_case_tasks(self, case_id: str) -> list:
         """Return all tasks of a case."""
         body = {
