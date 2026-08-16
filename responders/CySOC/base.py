@@ -23,7 +23,6 @@ class CySOCResponder(Responder):
         Responder.__init__(self, job_directory)
         self.thehive_url = self.get_param("config.TheHive URL", None, "TheHive URL is missing")
         self.thehive_api_key = self.get_param("config.TheHive API key", None, "TheHive API key is missing")
-        self.close_on_fp = self.get_param("config.Close on false positive", True)
         # Azure credentials — required only when an MDE action is enabled (the subclass checks).
         self.tenant_id = self.get_param("config.Azure tenant ID", None)
         self.client_id = self.get_param("config.Azure app client ID", None)

@@ -55,6 +55,9 @@ class DCSyncWhitelistResponder(CySOCResponder):
         # rather than blocking the job. Required for "update" (enforced in run()).
         self.consul_kv_whitelist = self.get_param("config.Consul KV whitelist", None)
         self.consul_token = self.get_param("config.Consul ACL token", None)
+        # Auto-close a whitelisted (false-positive) case. DCSync-only: the malware responder always
+        # closes its false positives.
+        self.close_on_fp = self.get_param("config.Close on false positive", True)
         # User-identity containment actions on true-positive, off by default. Azure credentials are
         # only required when one of these (or device isolation) is enabled (checked in run()).
         self.disable_user_on_tp = self.get_param("config.Disable user on true positive", False)
