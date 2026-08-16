@@ -125,6 +125,28 @@ class TheHiveClient:
                 f"Failed to tag case {case_id} with {added}: HTTP {resp.status_code} — {resp.text}"
             )
 
+    def remove_case_tags(self, case_id: str, tags: list, existing_tags=()) -> None:
+        """Remove tags from a case, keeping every other tag it carries.
+
+        Same mechanics as add_case_tags — the PATCH replaces the whole list, so the caller passes
+        the case's current tags. No-op when none of them is present.
+        """
+        current = list(existing_tags or [])
+        removed = [tag for tag in tags if tag in current]
+        if not removed:
+            return
+        resp = self.http.patch(
+            f"{self.url}/api/case/{case_id}",
+            headers=self.headers,
+            json={"tags": [tag for tag in current if tag not in removed]},
+            verify=self.verify,
+            timeout=30,
+        )
+        if not (200 <= resp.status_code < 300):
+            raise TheHiveError(
+                f"Failed to remove tag(s) {removed} from case {case_id}: HTTP {resp.status_code} — {resp.text}"
+            )
+
     def get_case_tasks(self, case_id: str) -> list:
         """Return all tasks of a case."""
         body = {
