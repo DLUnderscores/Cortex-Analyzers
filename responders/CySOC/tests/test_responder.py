@@ -50,6 +50,7 @@ class StubTheHive:
         self.observables = observables
         self.closed = []  # (case_id, verdict)
         self.logs = []  # (case_id, group, title, message)
+        self.tagged = []  # (case_id, tags, existing_tags)
 
     def get_case_observables(self, case_id):
         return self.observables
@@ -59,6 +60,9 @@ class StubTheHive:
 
     def close_case_true_positive(self, case_id):
         self.closed.append((case_id, "true-positive"))
+
+    def add_case_tags(self, case_id, tags, existing_tags=()):
+        self.tagged.append((case_id, list(tags), list(existing_tags)))
 
     def log_to_task(self, case_id, group, title, message, dedup=True):
         self.logs.append((case_id, group, title, message))
@@ -376,6 +380,16 @@ USM_CASE = {**CASE, "severity": 4, "description": "case body"}
 EXPECTED_CUSTOMER_REF = "https://gw.example.com/office/thehive/index.html#!/case/~4128/details"
 
 
+def assert_ticket_tag(thehive, ticket_no):
+    assert len(thehive.tagged) == 1
+    case_id, tags, existing_tags = thehive.tagged[0]
+    assert case_id == "~4128"
+    assert existing_tags == []
+    tag_ticket, timestamp_ms = tags[0].rsplit(";", 1)
+    assert tag_ticket == f"ext:Ticket={ticket_no}"
+    assert 1_000_000_000_000 <= int(timestamp_ms) < 10_000_000_000_000
+
+
 def test_check_tp_creates_usm_ticket(tmp_path):
     write_job(tmp_path, "check", case=USM_CASE, config_overrides=USM_ENABLED)
     thehive = StubTheHive(OBSERVABLES)
@@ -392,6 +406,7 @@ def test_check_tp_creates_usm_ticket(tmp_path):
     # title is prefixed with the TheHive case number (CASE.caseId == 42);
     # severity 4 (Critical) inverts to USM "1"; desc is the case description (no containment actions)
     assert usm.created == [("Case #42 - DCSync attack detected", "case body", "1", EXPECTED_CUSTOMER_REF)]
+    assert_ticket_tag(thehive, "IN-0005702")
     assert any("USM ticket created" in log[3] and "IN-0005702" in log[3] for log in thehive.logs)
     assert thehive.closed[0] == ("~4128", "true-positive")
 
@@ -405,6 +420,7 @@ def test_check_tp_uses_ticket_no_from_create_response_without_lookup(tmp_path):
 
     assert output["full"]["usm"] == {"status": "created", "ticketno": "IN-0005724"}
     assert usm.lookups == []
+    assert_ticket_tag(thehive, "IN-0005724")
 
 
 def test_check_tp_usm_ticket_no_lookup_failure_is_not_fatal(tmp_path):
@@ -416,6 +432,7 @@ def test_check_tp_usm_ticket_no_lookup_failure_is_not_fatal(tmp_path):
     # creation succeeded; only the (best-effort) number lookup failed — job still succeeds and closes
     assert output["success"] is True
     assert output["full"]["usm"] == {"status": "created", "ticketno": None}
+    assert thehive.tagged == []
     assert thehive.closed[0] == ("~4128", "true-positive")
 
 
@@ -457,6 +474,7 @@ def test_check_existing_usm_ticket_updated_on_reeval(tmp_path):
     }
     assert usm.lookups == [EXPECTED_CUSTOMER_REF]
     assert usm.updated == [("IN-0005702", "case body")]
+    assert_ticket_tag(thehive, "IN-0005702")
     assert any("IN-0005702 updated" in log[3] for log in thehive.logs)
 
 
@@ -473,6 +491,7 @@ def test_check_existing_usm_ticket_skipped_when_update_disabled(tmp_path):
     assert usm.updated == []
     # the number is still looked up (for the report) even though the update is disabled
     assert usm.lookups == [EXPECTED_CUSTOMER_REF]
+    assert_ticket_tag(thehive, "IN-0005702")
     assert any("update disabled" in log[3] for log in thehive.logs)
 
 

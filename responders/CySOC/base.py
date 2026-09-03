@@ -8,6 +8,8 @@ factories and shared config reads, MDE device isolation, and USM (service-desk)
 ticketing on true-positive. Each subclass reads its own extra config, supplies a
 log prefix via ``_log_prefix()``, and implements the case evaluation in ``run()``.
 """
+import time
+
 from cortexutils.responder import Responder
 
 from defender_client import DefenderActionError, DefenderClient
@@ -168,6 +170,14 @@ class CySOCResponder(Responder):
             )
         return ticket_no
 
+    def _tag_usm_ticket(self, thehive, case, case_id, ticket_no):
+        if ticket_no:
+            thehive.add_case_tags(
+                case_id,
+                [f"ext:Ticket={ticket_no};{time.time_ns() // 1_000_000}"],
+                case.get("tags") or [],
+            )
+
     def _handle_usm(self, thehive, case, case_id, actions):
         """Create (or, on reevaluation, update) a USM ticket for a true-positive case.
 
@@ -198,11 +208,13 @@ class CySOCResponder(Responder):
             # readall lookup if it didn't (e.g. an older API shape).
             if not ticket_no:
                 ticket_no = self._lookup_ticket_no(usm, customer_ref, thehive, case_id)
+            self._tag_usm_ticket(thehive, case, case_id, ticket_no)
             suffix = f" (ticket {ticket_no})" if ticket_no else ""
             self._log(thehive, case_id, f"{prefix}: USM ticket created — {customer_ref}{suffix}")
             return {"status": "created", "ticketno": ticket_no}
         # result == "exists": the case already has a ticket — resolve its number by lookup
         ticket_no = self._lookup_ticket_no(usm, customer_ref, thehive, case_id)
+        self._tag_usm_ticket(thehive, case, case_id, ticket_no)
         if self.update_usm_ticket_on_reeval:
             try:
                 if ticket_no:
