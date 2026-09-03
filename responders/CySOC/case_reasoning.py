@@ -91,16 +91,18 @@ def org_from_ref(ref):
     return ref.split(":", 1)[0] or None
 
 
-def org_of(case, fallback=None):
+def org_of(case, organisation=None):
     """The organisation whose config block applies to this case.
 
-    Primary source is the org-scoped ``internal-ref``, which is what the SOAR keys off — so a
-    case evaluated under an org's block is ticketed under the same block. An alert created
-    without a ``data_stream.namespace`` carries a bare ref with no org prefix; for those we
-    fall back to the organisation TheHive injects into the responder's job parameters (the
-    case's owning org), which the SOAR has no equivalent of.
+    Primary source is the case's owning organisation, which TheHive injects into the responder's
+    job parameters (the case object itself carries no organisation field). That is the same
+    organisation the SOAR targets when it creates the alert, so a case is ticketed under the block
+    it was evaluated under, and it stays right for a case moved between organisations.
+
+    Falls back to the organisation prefix of a scoped ``internal-ref`` (``<org>:<ref>``) for a job
+    with no organisation parameter — a responder run straight from the Cortex UI.
     """
-    return org_from_ref(internal_ref_of(case)) or fallback or None
+    return organisation or org_from_ref(internal_ref_of(case)) or None
 
 
 def resolve_template_name(title, mappings):

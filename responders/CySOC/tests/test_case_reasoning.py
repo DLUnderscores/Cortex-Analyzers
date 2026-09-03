@@ -113,19 +113,20 @@ def test_select_org_config_returns_a_flat_legacy_document_unchanged():
         ({}, None),
     ],
 )
-def test_org_of_reads_the_scoped_internal_ref(case, expected):
+def test_org_of_falls_back_to_the_scoped_internal_ref(case, expected):
+    """With no organisation parameter (a run straight from the Cortex UI), the ref carries it."""
     assert cr.org_of(case) == expected
 
 
-def test_org_of_falls_back_to_the_job_organisation_for_a_bare_ref():
-    case = {"customFields": {"internal-ref": {"string": "defender-1"}}}
+def test_org_of_prefers_the_job_organisation():
+    """The case's owning organisation, which TheHive passes in, decides the config block."""
+    case = {"customFields": {"internal-ref": {"string": "office:defender-1"}}}
     assert cr.org_of(case, "acme") == "acme"
 
 
-def test_org_of_prefers_the_internal_ref_over_the_job_organisation():
-    # The SOAR keys off internal-ref; ticketing must land on the same block it was evaluated under.
-    case = {"customFields": {"internal-ref": {"string": "office:defender-1"}}}
-    assert cr.org_of(case, "acme") == "office"
+def test_org_of_uses_the_job_organisation_for_a_bare_ref():
+    case = {"customFields": {"internal-ref": {"string": "defender-1"}}}
+    assert cr.org_of(case, "acme") == "acme"
 
 
 # --- title -> case template ------------------------------------------------------
