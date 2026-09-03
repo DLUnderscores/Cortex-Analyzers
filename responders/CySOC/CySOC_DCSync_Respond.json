@@ -55,6 +55,22 @@
             "defaultValue": ""
         },
         {
+            "name": "Consul KV case reasoning",
+            "description": "Consul KV key holding case-reasoning.yml, used to look up this case's per-organisation / per-case-type 'usm_template'. Optional: without it every ticket uses the built-in layout",
+            "type": "string",
+            "multi": false,
+            "required": false,
+            "defaultValue": ""
+        },
+        {
+            "name": "Consul KV case mappings",
+            "description": "Consul KV key holding case-mappings.yml, used to match the case title to a case template name. Required alongside 'Consul KV case reasoning' for USM ticket templates to apply",
+            "type": "string",
+            "multi": false,
+            "required": false,
+            "defaultValue": ""
+        },
+        {
             "name": "Close on false positive",
             "description": "Close the case automatically when every user+host pair is whitelisted",
             "type": "boolean",

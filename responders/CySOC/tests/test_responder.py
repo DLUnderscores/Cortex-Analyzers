@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+import base
 from dcsync_whitelist import DCSyncWhitelistResponder
 from defender_client import DefenderActionError
 from usm_client import USMError
@@ -139,14 +140,14 @@ class StubUSM:
         self.fail_create = fail_create
         self.fail_update = fail_update
         self.fail_lookup = fail_lookup
-        self.created = []  # (title, desc, severity, customer_ref)
+        self.created = []  # the create payload dict, as assembled by CySOCResponder._usm_payload
         self.updated = []  # (ticket_no, desc)
         self.lookups = []  # customer_ref
 
-    def create_ticket(self, title, desc, severity_value, customer_ref):
+    def create_ticket(self, payload):
         if self.fail_create:
             raise USMError("create failed")
-        self.created.append((title, desc, severity_value, customer_ref))
+        self.created.append(payload)
         return self.create_result, self.create_ticket_no
 
     def find_ticket_no(self, customer_ref):
@@ -182,7 +183,7 @@ class ResponderUnderTest(DCSyncWhitelistResponder):
         return self.stub_usm
 
 
-def write_job(tmp_path, service, case=CASE, config_overrides=None):
+def write_job(tmp_path, service, case=CASE, config_overrides=None, parameters=None):
     config = {
         "service": service,
         "TheHive URL": "http://thehive",
@@ -193,7 +194,16 @@ def write_job(tmp_path, service, case=CASE, config_overrides=None):
     config.update(config_overrides or {})
     (tmp_path / "input").mkdir()
     (tmp_path / "input" / "input.json").write_text(
-        json.dumps({"dataType": "thehive:case", "tlp": 2, "pap": 2, "data": case, "config": config})
+        json.dumps(
+            {
+                "dataType": "thehive:case",
+                "tlp": 2,
+                "pap": 2,
+                "data": case,
+                "config": config,
+                "parameters": parameters if parameters is not None else {"organisation": "office", "user": "soc"},
+            }
+        )
     )
     return tmp_path
 
@@ -400,12 +410,22 @@ def test_check_tp_creates_usm_ticket(tmp_path):
     assert output["full"]["usm"] == {
         "status": "created",
         "ticketno": "IN-0005702",
+        "template": None,
     }
     # the ticket number is looked up after creation so it can be reported
     assert usm.lookups == [EXPECTED_CUSTOMER_REF]
     # title is prefixed with the TheHive case number (CASE.caseId == 42);
     # severity 4 (Critical) inverts to USM "1"; desc is the case description (no containment actions)
-    assert usm.created == [("Case #42 - DCSync attack detected", "case body", "1", EXPECTED_CUSTOMER_REF)]
+    assert usm.created == [
+        {
+            "title": "Case #42 - DCSync attack detected",
+            "desc": "case body",
+            "urgencyMap1": "1",
+            "impactMap1": "1",
+            "type": "Disturbance",
+            "customerRef": EXPECTED_CUSTOMER_REF,
+        }
+    ]
     assert_ticket_tag(thehive, "IN-0005702")
     assert any("USM ticket created" in log[3] and "IN-0005702" in log[3] for log in thehive.logs)
     assert thehive.closed[0] == ("~4128", "true-positive")
@@ -418,7 +438,7 @@ def test_check_tp_uses_ticket_no_from_create_response_without_lookup(tmp_path):
     usm = StubUSM(create_result="created", create_ticket_no="IN-0005724")
     output = run_responder(tmp_path, thehive, StubWhitelist(), usm=usm)
 
-    assert output["full"]["usm"] == {"status": "created", "ticketno": "IN-0005724"}
+    assert output["full"]["usm"] == {"status": "created", "ticketno": "IN-0005724", "template": None}
     assert usm.lookups == []
     assert_ticket_tag(thehive, "IN-0005724")
 
@@ -431,7 +451,7 @@ def test_check_tp_usm_ticket_no_lookup_failure_is_not_fatal(tmp_path):
 
     # creation succeeded; only the (best-effort) number lookup failed — job still succeeds and closes
     assert output["success"] is True
-    assert output["full"]["usm"] == {"status": "created", "ticketno": None}
+    assert output["full"]["usm"] == {"status": "created", "ticketno": None, "template": None}
     assert thehive.tagged == []
     assert thehive.closed[0] == ("~4128", "true-positive")
 
@@ -443,7 +463,7 @@ def test_check_usm_title_falls_back_to_bare_title_without_case_number(tmp_path):
     usm = StubUSM(create_result="created")
     run_responder(tmp_path, thehive, StubWhitelist(), usm=usm)
 
-    assert usm.created[0][0] == "DCSync attack detected"
+    assert usm.created[0]["title"] == "DCSync attack detected"
 
 
 def test_check_usm_create_failure_fails_job_and_leaves_case_open(tmp_path):
@@ -471,6 +491,7 @@ def test_check_existing_usm_ticket_updated_on_reeval(tmp_path):
     assert output["full"]["usm"] == {
         "status": "exists",
         "ticketno": "IN-0005702",
+        "template": None,
     }
     assert usm.lookups == [EXPECTED_CUSTOMER_REF]
     assert usm.updated == [("IN-0005702", "case body")]
@@ -487,6 +508,7 @@ def test_check_existing_usm_ticket_skipped_when_update_disabled(tmp_path):
     assert output["full"]["usm"] == {
         "status": "exists",
         "ticketno": "IN-0005702",
+        "template": None,
     }
     assert usm.updated == []
     # the number is still looked up (for the report) even though the update is disabled
@@ -506,6 +528,7 @@ def test_check_usm_update_failure_is_not_fatal(tmp_path):
     assert output["full"]["usm"] == {
         "status": "exists",
         "ticketno": "IN-0005702",
+        "template": None,
     }
     assert thehive.closed[0] == ("~4128", "true-positive")
     assert any("FAILED to update existing USM ticket" in log[3] for log in thehive.logs)
@@ -534,6 +557,7 @@ def test_check_whitelist_not_configured_creates_usm_ticket(tmp_path):
     assert output["full"]["usm"] == {
         "status": "created",
         "ticketno": "IN-0005702",
+        "template": None,
     }
     assert len(usm.created) == 1
 
@@ -863,3 +887,159 @@ def test_check_fails_safe_when_only_destination_tagged(tmp_path):
 
     assert read_output(tmp_path)["success"] is False
     assert thehive.closed == []
+
+
+# --- USM ticket templating (per organisation, per case type) ---------------------------------------
+
+KV_REASONING = "cysoc/office/sirp/thehive/case-reasoning"
+KV_MAPPINGS = "cysoc/office/sirp/thehive/case-mappings"
+CONTAINMENT_ENABLED = {
+    "Disable user on true positive": True,
+    "Isolate device on true positive": True,
+    "Azure tenant ID": "t",
+    "Azure app client ID": "c",
+    "Azure app client secret": "s",
+}
+TEMPLATES_ENABLED = {
+    **USM_ENABLED,
+    "Consul URL": "http://consul:8500",
+    "Consul KV case reasoning": KV_REASONING,
+    "Consul KV case mappings": KV_MAPPINGS,
+}
+MAPPINGS_DOC = {"_default_": {"DCSync Attack (Microsoft Defender for Identity)": ["dcsync attack"]}}
+
+
+def dcsync_reasoning_doc(usm_template, org="_default_"):
+    return {
+        org: {
+            "DCSync Attack (Microsoft Defender for Identity)": {
+                "response": {
+                    "CySOC_DCSync_Respond_1_0": {
+                        "type": "__case__",
+                        "value": "Success",
+                        "usm_template": usm_template,
+                    }
+                }
+            }
+        }
+    }
+
+
+@pytest.fixture
+def kv(monkeypatch):
+    """Serve the two case-config documents the responder reads from Consul KV."""
+    docs = {}
+
+    def fake_read(url, key, token=None, http=None):
+        if key not in docs:
+            raise AssertionError(f"Unexpected Consul KV read: {key}")
+        return docs[key]
+
+    monkeypatch.setattr(base.case_reasoning, "read_kv_yaml", fake_read)
+    return docs
+
+
+def test_builtin_desc_lists_the_containment_actions_taken(tmp_path):
+    # Pins the built-in layout that a case with no usm_template still gets.
+    write_job(
+        tmp_path,
+        "check",
+        case=USM_CASE,
+        config_overrides={**USM_ENABLED, **CONTAINMENT_ENABLED},
+    )
+    thehive = StubTheHive(two_user_one_host_observables())
+    whitelist = StubWhitelist({pair_key(USER1_GUID, LAB1_DEVICE_ID): {"account": "user1"}})
+    usm = StubUSM()
+
+    run_responder(tmp_path, thehive, whitelist, StubDefender(), usm=usm)
+
+    desc = usm.created[0]["desc"]
+    assert desc.startswith("case body\n\nContainment actions taken:\n")
+    assert f"- disable_user in Entra on user2 ({USER2_GUID}): OK" in desc
+    assert f"- isolate_device on lab1 ({LAB1_DEVICE_ID}): OK" in desc
+
+
+def test_usm_template_renders_pairs_and_actions(tmp_path, kv):
+    kv[KV_MAPPINGS] = MAPPINGS_DOC
+    kv[KV_REASONING] = dcsync_reasoning_doc(
+        {
+            "title": "DCSync — [[ unmatched_pairs ]]",
+            "desc": "[[ description ]]\nactions ([[ actions_summary ]]):\n[[ actions ]]",
+        }
+    )
+    write_job(
+        tmp_path, "check", case=USM_CASE, config_overrides={**TEMPLATES_ENABLED, **CONTAINMENT_ENABLED}
+    )
+    thehive = StubTheHive(two_user_one_host_observables())
+    whitelist = StubWhitelist({pair_key(USER1_GUID, LAB1_DEVICE_ID): {"account": "user1"}})
+    usm = StubUSM()
+
+    output = run_responder(tmp_path, thehive, whitelist, StubDefender(), usm=usm)
+
+    ticket = usm.created[0]
+    assert ticket["title"] == "DCSync — user2@lab1"
+    assert ticket["desc"].startswith("case body\nactions (2 succeeded):\n- disable_user in Entra on user2")
+    assert ticket["urgencyMap1"] == "1"  # untouched by the template
+    assert output["full"]["usm"]["template"] == "DCSync Attack (Microsoft Defender for Identity)"
+
+
+def test_usm_template_applies_on_the_whitelist_not_configured_path(tmp_path, kv):
+    # The other true-positive route: no whitelist key, case left open, ticket still raised.
+    kv[KV_MAPPINGS] = MAPPINGS_DOC
+    kv[KV_REASONING] = dcsync_reasoning_doc({"desc": "pairs=[[ pairs ]] actions=[[ actions ]]"})
+    write_job(
+        tmp_path,
+        "check",
+        case=USM_CASE,
+        config_overrides={**TEMPLATES_ENABLED, "Consul KV whitelist": ""},
+    )
+    thehive = StubTheHive(OBSERVABLES)
+    usm = StubUSM()
+
+    run_responder(tmp_path, thehive, StubWhitelist(), usm=usm)
+
+    assert usm.created[0]["desc"] == "pairs=svc-sync@ws01.socdev.lan actions="
+    assert thehive.closed == []
+
+
+def test_usm_template_can_reach_case_custom_fields(tmp_path, kv):
+    kv[KV_MAPPINGS] = MAPPINGS_DOC
+    kv[KV_REASONING] = dcsync_reasoning_doc({"desc": "ref=[[ cf.internal-ref ]] org=[[ organisation ]]"})
+    case = {**USM_CASE, "customFields": {"internal-ref": {"string": "office:defender-77", "order": 0}}}
+    write_job(tmp_path, "check", case=case, config_overrides=TEMPLATES_ENABLED)
+    thehive = StubTheHive(OBSERVABLES)
+    usm = StubUSM()
+
+    run_responder(tmp_path, thehive, StubWhitelist(), usm=usm)
+
+    assert usm.created[0]["desc"] == "ref=office:defender-77 org=office"
+
+
+def test_usm_template_overriding_customer_ref_is_honoured_and_flagged(tmp_path, kv):
+    kv[KV_MAPPINGS] = MAPPINGS_DOC
+    kv[KV_REASONING] = dcsync_reasoning_doc({"customerRef": "CUSTOM-REF"})
+    write_job(tmp_path, "check", case=USM_CASE, config_overrides=TEMPLATES_ENABLED)
+    thehive = StubTheHive(OBSERVABLES)
+    usm = StubUSM()
+
+    run_responder(tmp_path, thehive, StubWhitelist(), usm=usm)
+
+    assert usm.created[0]["customerRef"] == "CUSTOM-REF"
+    assert any("overrides customerRef" in m for *_, m in thehive.logs)
+
+
+def test_templated_desc_is_used_when_updating_an_existing_ticket(tmp_path, kv):
+    kv[KV_MAPPINGS] = MAPPINGS_DOC
+    kv[KV_REASONING] = dcsync_reasoning_doc({"desc": "templated body"})
+    write_job(
+        tmp_path,
+        "check",
+        case=USM_CASE,
+        config_overrides={**TEMPLATES_ENABLED, "Update USM ticket on case reevaluation": True},
+    )
+    thehive = StubTheHive(OBSERVABLES)
+    usm = StubUSM(create_result="exists")
+
+    run_responder(tmp_path, thehive, StubWhitelist(), usm=usm)
+
+    assert usm.updated == [("IN-0005702", "templated body")]

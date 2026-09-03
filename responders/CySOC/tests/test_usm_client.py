@@ -6,11 +6,24 @@ from usm_client import USMClient, USMError
 CUSTOMER_REF = "https://gw.example.com/office/thehive/index.html#!/case/~4128/details"
 
 
+def payload(title="t", desc="d", severity="3", customer_ref=CUSTOMER_REF, **extra):
+    """A create body in the shape CySOCResponder._usm_payload assembles."""
+    return {
+        "title": title,
+        "desc": desc,
+        "urgencyMap1": severity,
+        "impactMap1": severity,
+        "type": "Disturbance",
+        "customerRef": customer_ref,
+        **extra,
+    }
+
+
 def test_create_ticket_created_sends_expected_body(fake_http):
     fake_http.route("POST", "/api/create", FakeResponse(200, {"message": "Object successfully created"}))
     client = USMClient("https://usm", "secret", http=fake_http)
 
-    result = client.create_ticket("DCSync attack detected", "case body", "1", CUSTOMER_REF)
+    result = client.create_ticket(payload("DCSync attack detected", "case body", "1"))
 
     # no ticket number echoed in this response -> None (caller falls back to a readall lookup)
     assert result == ("created", None)
@@ -26,6 +39,20 @@ def test_create_ticket_created_sends_expected_body(fake_http):
     }
 
 
+
+def test_create_ticket_sends_template_added_fields_and_drops_nulls(fake_http):
+    # The body is passed through verbatim, so a usm_template can introduce a USM field without a
+    # client change; a null drops a defaulted field rather than sending "None".
+    fake_http.route("POST", "/api/create", FakeResponse(200, {"message": "Object successfully created"}))
+    client = USMClient("https://usm", "secret", http=fake_http)
+
+    client.create_ticket(payload(category="Security", impactMap1=None))
+
+    body = fake_http.calls[-1]["json"]
+    assert body["category"] == "Security"
+    assert "impactMap1" not in body
+
+
 def test_create_ticket_returns_ticket_no_from_response(fake_http):
     # the create response assigns the new ticket's number under newIds — returned directly, no lookup
     create_response = {
@@ -36,7 +63,7 @@ def test_create_ticket_returns_ticket_no_from_response(fake_http):
     fake_http.route("POST", "/api/create", FakeResponse(200, create_response))
     client = USMClient("https://usm", "secret", http=fake_http)
 
-    assert client.create_ticket("t", "d", "1", CUSTOMER_REF) == ("created", "IN-0005727")
+    assert client.create_ticket(payload(severity="1")) == ("created", "IN-0005727")
 
 
 def test_create_ticket_existing_customer_ref_returns_exists(fake_http):
@@ -44,7 +71,7 @@ def test_create_ticket_existing_customer_ref_returns_exists(fake_http):
     fake_http.route("POST", "/api/create", FakeResponse(400, {"message": "CustomerReference exist"}))
     client = USMClient("https://usm", "secret", http=fake_http)
 
-    assert client.create_ticket("t", "d", "3", CUSTOMER_REF) == ("exists", None)
+    assert client.create_ticket(payload()) == ("exists", None)
 
 
 def test_create_ticket_http_error_raises(fake_http):
@@ -52,7 +79,7 @@ def test_create_ticket_http_error_raises(fake_http):
     client = USMClient("https://usm", "secret", http=fake_http)
 
     with pytest.raises(USMError):
-        client.create_ticket("t", "d", "3", CUSTOMER_REF)
+        client.create_ticket(payload())
 
 
 def test_create_ticket_unknown_message_raises(fake_http):
@@ -60,7 +87,7 @@ def test_create_ticket_unknown_message_raises(fake_http):
     client = USMClient("https://usm", "secret", http=fake_http)
 
     with pytest.raises(USMError):
-        client.create_ticket("t", "d", "3", CUSTOMER_REF)
+        client.create_ticket(payload())
 
 
 class NonJSONResponse:
@@ -79,7 +106,7 @@ def test_create_ticket_non_json_body_raises_usm_error(fake_http):
     client = USMClient("https://usm", "secret", http=fake_http)
 
     with pytest.raises(USMError):
-        client.create_ticket("t", "d", "3", CUSTOMER_REF)
+        client.create_ticket(payload())
 
 
 def test_find_ticket_no_returns_first_match(fake_http):

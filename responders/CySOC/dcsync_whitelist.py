@@ -47,14 +47,17 @@ LOG_PREFIX = {"check": "CySOC_DCSync_Respond", "update": "CySOC_DCSync_UpdateWhi
 
 
 class DCSyncWhitelistResponder(CySOCResponder):
+    # Name this responder is known by in case-reasoning.yml's ``response:`` map, used to find its
+    # own per-org/per-case-type USM ticket template. Only the "check" flavor raises tickets.
+    RESPONDER_BASE_NAME = "CySOC_DCSync_Respond"
+
     def __init__(self, job_directory=None):
         super().__init__(job_directory)
         self.service = self.get_param("config.service", None, "Service parameter is missing")
-        self.consul_url = self.get_param("config.Consul URL", "http://consul.service.consul:8500")
+        # Consul URL / ACL token are read by the base class (shared with the USM template lookup).
         # Optional for "check" — an unconfigured whitelist fails safe to "not whitelisted"
         # rather than blocking the job. Required for "update" (enforced in run()).
         self.consul_kv_whitelist = self.get_param("config.Consul KV whitelist", None)
-        self.consul_token = self.get_param("config.Consul ACL token", None)
         # Auto-close a whitelisted (false-positive) case. DCSync-only: the malware responder always
         # closes its false positives.
         self.close_on_fp = self.get_param("config.Close on false positive", True)
@@ -63,9 +66,15 @@ class DCSyncWhitelistResponder(CySOCResponder):
         self.disable_user_on_tp = self.get_param("config.Disable user on true positive", False)
         self.force_password_reset_on_tp = self.get_param("config.Force password reset on true positive", False)
         self.revoke_sessions_on_tp = self.get_param("config.Revoke sessions on true positive", False)
+        # Filled in by check() before the ticket is raised; see _usm_extra_context.
+        self._usm_pairs_context = {}
 
     def _log_prefix(self):
         return LOG_PREFIX.get(self.service, self.service)
+
+    def _usm_extra_context(self):
+        """DCSync template variables: the pairs the verdict was reached on, and their parts."""
+        return dict(self._usm_pairs_context)
 
     def _whitelist(self):
         return ConsulWhitelist(self.consul_url, self.consul_kv_whitelist, token=self.consul_token)
@@ -324,6 +333,14 @@ class DCSyncWhitelistResponder(CySOCResponder):
                 matched.append({**pair, "entry": entries[pair["key"]]})
             else:
                 unmatched.append(pair)
+
+        self._usm_pairs_context = {
+            "pairs": ", ".join(f"{p['user']}@{p['host']}" for p in pairs),
+            "unmatched_pairs": ", ".join(f"{p['user']}@{p['host']}" for p in unmatched),
+            "whitelisted_pairs": ", ".join(f"{p['user']}@{p['host']}" for p in matched),
+            "users": ", ".join(dict.fromkeys(p["user"] for p in pairs)),
+            "hosts": ", ".join(dict.fromkeys(p["host"] for p in pairs)),
+        }
 
         case_closed = False
         actions = []

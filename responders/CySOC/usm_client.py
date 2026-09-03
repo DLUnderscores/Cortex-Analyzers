@@ -3,6 +3,9 @@
 """Minimal USM (Axpo service-desk) API client used by the DCSync whitelist responder.
 
 Creates/looks-up/updates service-desk tickets. Authentication is a single ``apiKey`` header.
+The create body is assembled by the caller and passed through verbatim, so per-customer /
+per-case-type ticket templates need no change here.
+
 The create endpoint enforces a unique ``customerRef`` per ticket: an attempt to create a ticket
 whose customerRef already exists returns a benign ``CustomerReference exist`` message (HTTP 2xx)
 rather than an error — create_ticket reports that as ``"exists"`` so the caller can decide
@@ -74,28 +77,26 @@ class USMClient:
                 f"{context}: HTTP {resp.status_code} with non-JSON body ({resp.text!r}) — {exc}"
             ) from exc
 
-    def create_ticket(self, title: str, desc: str, severity_value: str, customer_ref: str) -> tuple:
-        """Create a ticket. Returns ``(status, ticket_no)``.
+    def create_ticket(self, payload: dict) -> tuple:
+        """Create a ticket from a ready-made body. Returns ``(status, ticket_no)``.
+
+        ``payload`` is sent to /api/create verbatim. The caller (``CySOCResponder._usm_payload``)
+        assembles it from the built-in defaults plus any per-org/per-case template, which is why
+        this client does not impose a field list of its own — a template can introduce a USM
+        field without a change here. Keys whose value is None are dropped, so a template can
+        remove a defaulted field by setting it to null.
 
         ``status`` is "created" on success or "exists" if the customerRef is already taken;
         ``ticket_no`` is the new ticket number when the create response carries it (the server
         assigns and echoes it on create), else None — only meaningful for "created".
 
-        urgencyMap1 and impactMap1 are both set to severity_value (the USM severity scale).
         USM signals an already-used customerRef with a ``CustomerReference exist`` message and an
         HTTP 400 status, so the message is checked before (and independently of) the status code;
         that case is benign ("exists"), not a failure. Any other non-2xx or unrecognised response
         is an error — an uncertain creation must not be silently swallowed by a caller that fails
         only on creation errors.
         """
-        body = {
-            "title": title,
-            "desc": desc,
-            "urgencyMap1": severity_value,
-            "impactMap1": severity_value,
-            "type": TICKET_TYPE,
-            "customerRef": customer_ref,
-        }
+        body = {k: v for k, v in payload.items() if v is not None}
         resp = self.http.post(
             f"{self.url}/api/create",
             headers=self.headers,
@@ -103,14 +104,14 @@ class USMClient:
             verify=self.verify,
             timeout=30,
         )
-        payload = self._json(resp, "Unexpected response when creating ticket")
-        message = payload.get("message", "")
+        result = self._json(resp, "Unexpected response when creating ticket")
+        message = result.get("message", "")
         if message == "CustomerReference exist":
             return "exists", None
         if not (200 <= resp.status_code < 300):
             raise USMError(f"Failed to create ticket: HTTP {resp.status_code} — {resp.text}")
         if message == "Object successfully created":
-            return "created", self._extract_ticket_no(payload)
+            return "created", self._extract_ticket_no(result)
         raise USMError(f"Unexpected response when creating ticket: {message!r} — {resp.text}")
 
     def find_ticket_no(self, customer_ref: str) -> Optional[str]:
