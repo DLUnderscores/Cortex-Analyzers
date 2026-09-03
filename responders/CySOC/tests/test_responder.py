@@ -1015,7 +1015,8 @@ def test_usm_template_can_reach_case_custom_fields(tmp_path, kv):
     assert usm.created[0]["desc"] == "ref=office:defender-77 org=office"
 
 
-def test_usm_template_overriding_customer_ref_is_honoured_and_flagged(tmp_path, kv):
+def test_usm_template_cannot_change_customer_ref(tmp_path, kv):
+    """customerRef is the case link and the create-idempotency key — a template never changes it."""
     kv[KV_MAPPINGS] = MAPPINGS_DOC
     kv[KV_REASONING] = dcsync_reasoning_doc({"customerRef": "CUSTOM-REF"})
     write_job(tmp_path, "check", case=USM_CASE, config_overrides=TEMPLATES_ENABLED)
@@ -1024,8 +1025,21 @@ def test_usm_template_overriding_customer_ref_is_honoured_and_flagged(tmp_path, 
 
     run_responder(tmp_path, thehive, StubWhitelist(), usm=usm)
 
-    assert usm.created[0]["customerRef"] == "CUSTOM-REF"
-    assert any("overrides customerRef" in m for *_, m in thehive.logs)
+    assert usm.created[0]["customerRef"] == EXPECTED_CUSTOMER_REF
+    assert any("sets customerRef — ignored" in m for *_, m in thehive.logs)
+
+
+def test_usm_template_cannot_drop_customer_ref(tmp_path, kv):
+    """A null value drops any other key from the body; customerRef survives it."""
+    kv[KV_MAPPINGS] = MAPPINGS_DOC
+    kv[KV_REASONING] = dcsync_reasoning_doc({"customerRef": None})
+    write_job(tmp_path, "check", case=USM_CASE, config_overrides=TEMPLATES_ENABLED)
+    thehive = StubTheHive(OBSERVABLES)
+    usm = StubUSM()
+
+    run_responder(tmp_path, thehive, StubWhitelist(), usm=usm)
+
+    assert usm.created[0]["customerRef"] == EXPECTED_CUSTOMER_REF
 
 
 def test_templated_desc_is_used_when_updating_an_existing_ticket(tmp_path, kv):

@@ -289,7 +289,8 @@ class CySOCResponder(Responder):
 
         Starting from the defaults means a template that sets only ``desc`` keeps the standard
         title and severity mapping, and an absent template reproduces the pre-template ticket
-        exactly. A template key set to null drops that field from the body.
+        exactly. A template key set to null drops that field from the body — except
+        ``customerRef``, which is not templatable at all (see below).
         """
         payload = {
             "title": self._usm_title(case),
@@ -309,14 +310,15 @@ class CySOCResponder(Responder):
                 f"{self._log_prefix()}: USM ticket template referenced unknown variable(s), rendered "
                 f"as empty: {', '.join(unknown)}",
             )
-        if rendered.get("customerRef") not in (None, customer_ref):
-            # customerRef is the create-idempotency key and what find_ticket_no() looks the ticket
-            # up by; overriding it is honoured but breaks the link back to the case, so say so.
+        # customerRef is the create-idempotency key and what find_ticket_no() looks the ticket up by,
+        # so it is owned by the responder: a template that sets (or nulls) it is ignored rather than
+        # honoured, since either would break the link back to the case.
+        if rendered.pop("customerRef", customer_ref) != customer_ref:
             self._log(
                 thehive,
                 case_id,
-                f"{self._log_prefix()}: USM ticket template overrides customerRef — case reevaluation "
-                "will no longer find this ticket",
+                f"{self._log_prefix()}: USM ticket template sets customerRef — ignored, the case "
+                f"URL is always used ({customer_ref})",
             )
         payload.update(rendered)
         return payload
