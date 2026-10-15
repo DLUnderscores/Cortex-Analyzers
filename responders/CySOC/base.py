@@ -10,7 +10,6 @@ log prefix via ``_log_prefix()``, declares its ``RESPONDER_BASE_NAME`` (used to 
 its own entry in case-reasoning), optionally contributes template variables via
 ``_usm_extra_context()``, and implements the case evaluation in ``run()``.
 """
-import time
 from datetime import datetime, timezone
 
 from cortexutils.responder import Responder
@@ -348,7 +347,7 @@ class CySOCResponder(Responder):
         if ticket_no:
             thehive.add_case_tags(
                 case_id,
-                [f"ext:Ticket={ticket_no};{time.time_ns() // 1_000_000}"],
+                [f"ext:Ticket={ticket_no}"],
                 case.get("tags") or [],
             )
 

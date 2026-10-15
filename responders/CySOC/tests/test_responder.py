@@ -395,9 +395,7 @@ def assert_ticket_tag(thehive, ticket_no):
     case_id, tags, existing_tags = thehive.tagged[0]
     assert case_id == "~4128"
     assert existing_tags == []
-    tag_ticket, timestamp_ms = tags[0].rsplit(";", 1)
-    assert tag_ticket == f"ext:Ticket={ticket_no}"
-    assert 1_000_000_000_000 <= int(timestamp_ms) < 10_000_000_000_000
+    assert tags == [f"ext:Ticket={ticket_no}"]
 
 
 def test_check_tp_creates_usm_ticket(tmp_path):
