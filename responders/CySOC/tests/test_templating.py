@@ -27,9 +27,8 @@ def test_render_reports_unknown_names_and_renders_them_empty():
     assert unknown == {"nope", "cf.missing"}
 
 
-def test_render_leaves_consul_template_style_braces_alone():
-    # case-reasoning.yml is rendered by consul-template with the default {{ }} delimiters, so
-    # templates use [[ ]]; anything in {{ }} is not ours to touch.
+def test_render_leaves_double_braces_alone():
+    # Only [[ ]] is a placeholder; {{ }} passes through verbatim.
     assert templating.render("{{ key \"x\" }} [[ t ]]", {"t": "v"}) == '{{ key "x" }} v'
 
 
