@@ -8,7 +8,8 @@ check:  Evaluate every (user, host) pair derived from the case observables
         disables the user's Entra account and/or isolates the source device
         (only the non-whitelisted users/devices — see below), then closes
         the case as a true positive only if every attempted action
-        succeeded. Canonical ids come exclusively from the MicrosoftDefender
+        succeeded. A successful USM ticket handoff sets Confirmed instead,
+        keeping the case active for external follow-up. Canonical ids come exclusively from the MicrosoftDefender
         enrichment reports attached to the observables; an observable
         without enrichment fails the job (fail-safe: the case is never
         closed on incomplete information). If the whitelist itself isn't
@@ -343,6 +344,7 @@ class DCSyncWhitelistResponder(CySOCResponder):
         }
 
         case_closed = False
+        case_confirmed = False
         actions = []
         usm_result = None
         if whitelist is None:
@@ -360,10 +362,17 @@ class DCSyncWhitelistResponder(CySOCResponder):
             actions, all_succeeded = self._containment_actions(defender, case, unmatched)
             for action in actions:
                 self._log_action(thehive, case_id, action)
-            # Create the ticket before closing: a failed creation fails the job and leaves the case
-            # open (containment has already run regardless of the ticket outcome).
+            # A successful ticket handoff keeps the case active for external follow-up.
+            # Failed creation fails the job before the case state changes.
             usm_result = self._handle_usm(thehive, case, case_id, actions)
-            if all_succeeded:
+            if all_succeeded and usm_result:
+                thehive.confirm_case_true_positive(case_id)
+                case_confirmed = True
+                log_message = (
+                    f"{LOG_PREFIX['check']}: confirmed as a true-positive — external ticket requires "
+                    f"follow-up — {base_message}"
+                )
+            elif all_succeeded:
                 thehive.close_case_true_positive(case_id)
                 case_closed = True
                 log_message = f"{LOG_PREFIX['check']}: closed automatically as a true-positive — {base_message}"
@@ -397,6 +406,7 @@ class DCSyncWhitelistResponder(CySOCResponder):
                 "actions": actions,
                 "usm": usm_result,
                 "case_closed": case_closed,
+                "case_confirmed": case_confirmed,
             }
         )
 

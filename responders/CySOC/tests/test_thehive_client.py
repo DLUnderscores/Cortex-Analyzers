@@ -306,3 +306,28 @@ def test_log_to_task_writes_when_different_from_last(fake_http):
 
     log_calls = [c for c in fake_http.calls if c["url"].endswith(f"{TASK_ID}/log")]
     assert log_calls[0]["json"] == {"message": "new message"}
+
+
+
+def test_confirm_case_true_positive_keeps_case_active(fake_http):
+    fake_http.route("PATCH", f"/api/case/{CASE_ID}", FakeResponse(200, {}))
+    client = TheHiveClient("http://thehive", "key", http=fake_http)
+
+    client.confirm_case_true_positive(CASE_ID)
+
+    assert len(fake_http.calls) == 1
+    call = fake_http.calls[0]
+    assert call["method"] == "PATCH"
+    assert call["url"] == f"http://thehive/api/case/{CASE_ID}"
+    assert call["json"] == {"status": "Confirmed", "resolutionStatus": "TruePositive", "impactStatus": "WithImpact"}
+    assert "summary" not in call["json"]
+    assert "endDate" not in call["json"]
+
+
+@pytest.mark.parametrize("status_code", [401, 403, 500])
+def test_confirm_case_true_positive_raises_on_error(fake_http, status_code):
+    fake_http.route("PATCH", f"/api/case/{CASE_ID}", FakeResponse(status_code, text="request failed"))
+    client = TheHiveClient("http://thehive", "key", http=fake_http)
+
+    with pytest.raises(TheHiveError, match="Failed to confirm case"):
+        client.confirm_case_true_positive(CASE_ID)

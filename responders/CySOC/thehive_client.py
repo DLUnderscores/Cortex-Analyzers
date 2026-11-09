@@ -82,6 +82,18 @@ class TheHiveClient:
         if not (200 <= resp.status_code < 300):
             raise TheHiveError(f"Failed to close case {case_id}: HTTP {resp.status_code} — {resp.text}")
 
+    def confirm_case_true_positive(self, case_id: str) -> None:
+        """Keep a ticketed true positive active for external follow-up."""
+        resp = self.http.patch(
+            f"{self.url}/api/case/{case_id}",
+            headers=self.headers,
+            json={"status": "Confirmed", "resolutionStatus": "TruePositive", "impactStatus": "WithImpact"},
+            verify=self.verify,
+            timeout=30,
+        )
+        if not (200 <= resp.status_code < 300):
+            raise TheHiveError(f"Failed to confirm case {case_id}: HTTP {resp.status_code} — {resp.text}")
+
     def close_case_indeterminate(self, case_id: str) -> None:
         # Same two-PATCH approach as close_case_false_positive (see its note): close with
         # {status: "Resolved"} first, then set the verdict separately so setResolutionStatus runs

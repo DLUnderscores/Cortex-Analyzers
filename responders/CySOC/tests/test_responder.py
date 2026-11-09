@@ -5,6 +5,7 @@ import pytest
 import base
 from dcsync_whitelist import DCSyncWhitelistResponder
 from defender_client import DefenderActionError
+from thehive_client import TheHiveError
 from usm_client import USMError
 from whitelist import pair_key
 
@@ -50,6 +51,7 @@ class StubTheHive:
     def __init__(self, observables):
         self.observables = observables
         self.closed = []  # (case_id, verdict)
+        self.confirmed = []
         self.logs = []  # (case_id, group, title, message)
         self.tagged = []  # (case_id, tags, existing_tags)
 
@@ -61,6 +63,9 @@ class StubTheHive:
 
     def close_case_true_positive(self, case_id):
         self.closed.append((case_id, "true-positive"))
+
+    def confirm_case_true_positive(self, case_id):
+        self.confirmed.append(case_id)
 
     def add_case_tags(self, case_id, tags, existing_tags=()):
         self.tagged.append((case_id, list(tags), list(existing_tags)))
@@ -426,7 +431,10 @@ def test_check_tp_creates_usm_ticket(tmp_path):
     ]
     assert_ticket_tag(thehive, "IN-0005702")
     assert any("USM ticket created" in log[3] and "IN-0005702" in log[3] for log in thehive.logs)
-    assert thehive.closed[0] == ("~4128", "true-positive")
+    assert thehive.closed == []
+    assert thehive.confirmed == ["~4128"]
+    assert output["full"]["case_confirmed"] is True
+    assert output["full"]["case_closed"] is False
 
 
 def test_check_tp_uses_ticket_no_from_create_response_without_lookup(tmp_path):
@@ -447,11 +455,14 @@ def test_check_tp_usm_ticket_no_lookup_failure_is_not_fatal(tmp_path):
     usm = StubUSM(create_result="created", fail_lookup=True)
     output = run_responder(tmp_path, thehive, StubWhitelist(), usm=usm)
 
-    # creation succeeded; only the (best-effort) number lookup failed — job still succeeds and closes
+    # creation succeeded; only the (best-effort) number lookup failed — job still succeeds and confirms
     assert output["success"] is True
     assert output["full"]["usm"] == {"status": "created", "ticketno": None, "template": None}
     assert thehive.tagged == []
-    assert thehive.closed[0] == ("~4128", "true-positive")
+    assert thehive.closed == []
+    assert thehive.confirmed == ["~4128"]
+    assert output["full"]["case_confirmed"] is True
+    assert output["full"]["case_closed"] is False
 
 
 def test_check_usm_title_falls_back_to_bare_title_without_case_number(tmp_path):
@@ -475,7 +486,8 @@ def test_check_usm_create_failure_fails_job_and_leaves_case_open(tmp_path):
     output = read_output(tmp_path)
     assert output["success"] is False
     assert "USM ticket creation failed" in output["errorMessage"]
-    assert thehive.closed == []  # created before close, so a failed ticket leaves the case open
+    assert thehive.closed == []
+    assert thehive.confirmed == []  # Failed ticket creation leaves the case open
     assert any("FAILED" in log[3] for log in thehive.logs)
 
 
@@ -528,7 +540,10 @@ def test_check_usm_update_failure_is_not_fatal(tmp_path):
         "ticketno": "IN-0005702",
         "template": None,
     }
-    assert thehive.closed[0] == ("~4128", "true-positive")
+    assert thehive.closed == []
+    assert thehive.confirmed == ["~4128"]
+    assert output["full"]["case_confirmed"] is True
+    assert output["full"]["case_closed"] is False
     assert any("FAILED to update existing USM ticket" in log[3] for log in thehive.logs)
 
 
@@ -552,6 +567,8 @@ def test_check_whitelist_not_configured_creates_usm_ticket(tmp_path):
 
     assert output["full"]["verdict"] == "true-positive"
     assert output["full"]["case_closed"] is False  # left open for manual review
+    assert output["full"]["case_confirmed"] is False
+    assert thehive.confirmed == []
     assert output["full"]["usm"] == {
         "status": "created",
         "ticketno": "IN-0005702",
@@ -1055,3 +1072,46 @@ def test_templated_desc_is_used_when_updating_an_existing_ticket(tmp_path, kv):
     run_responder(tmp_path, thehive, StubWhitelist(), usm=usm)
 
     assert usm.updated == [("IN-0005702", "templated body")]
+
+
+@pytest.mark.parametrize("ticket_status", ["created", "exists"])
+def test_check_ticket_handoff_confirms_without_closing(tmp_path, ticket_status):
+    write_job(tmp_path, "check", case=USM_CASE, config_overrides=USM_ENABLED)
+    thehive = StubTheHive(OBSERVABLES)
+    output = run_responder(tmp_path, thehive, StubWhitelist(), usm=StubUSM(create_result=ticket_status))
+
+    assert output["success"] is True
+    assert output["full"]["case_confirmed"] is True
+    assert output["full"]["case_closed"] is False
+    assert thehive.confirmed == ["~4128"]
+    assert thehive.closed == []
+    assert any("external ticket requires follow-up" in log[3] for log in thehive.logs)
+
+
+def test_check_ticket_does_not_confirm_after_containment_failure(tmp_path):
+    overrides = {**USM_ENABLED, "Disable user on true positive": True,
+                 "Azure tenant ID": "t", "Azure app client ID": "c", "Azure app client secret": "s"}
+    write_job(tmp_path, "check", case=USM_CASE, config_overrides=overrides)
+    thehive = StubTheHive(OBSERVABLES)
+    usm = StubUSM()
+    output = run_responder(tmp_path, thehive, StubWhitelist(), StubDefender(fail_users=[USER_GUID]), usm=usm)
+
+    assert usm.created
+    assert output["full"]["case_confirmed"] is False
+    assert output["full"]["case_closed"] is False
+    assert thehive.confirmed == []
+    assert thehive.closed == []
+
+
+
+def test_check_confirmation_failure_fails_job_without_closing(tmp_path):
+    write_job(tmp_path, "check", case=USM_CASE, config_overrides=USM_ENABLED)
+    thehive = StubTheHive(OBSERVABLES)
+
+    def fail_confirmation(case_id):
+        raise TheHiveError("confirmation failed")
+
+    thehive.confirm_case_true_positive = fail_confirmation
+    with pytest.raises(SystemExit, match="confirmation failed"):
+        run_responder(tmp_path, thehive, StubWhitelist(), usm=StubUSM())
+    assert thehive.closed == []
