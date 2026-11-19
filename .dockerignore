@@ -1,0 +1,11 @@
+.git
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+thehive-templates/*.zip
+.claude
+.idea
+.vscode
+Dockerfile
+.dockerignore
+Taskfile.yml

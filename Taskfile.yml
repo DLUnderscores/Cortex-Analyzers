@@ -1,0 +1,95 @@
+version: "3"
+
+# task build builds the Cortex image with these analyzers and responders, FROM the Cortex image of
+# CORTEX_IMAGE, and pushes it to reg0.dreamlab.net/cysoc/cortex:
+#   task build [--yes]   release build, tagged RELEASE: <Cortex tag>-AN-<commit, 7>
+#                        (4.1.0-1-9f1bc90-DL001-AN-2cc0dd3). Refuses uncommitted changes (modified,
+#                        staged or untracked files). A tag the registry already has is moved after a
+#                        confirmation (--yes gives it).
+#   task build TAG=<tag> debug build, tagged <tag> as given: uncommitted changes are built in (the
+#                        image is labelled net.dreamlab.cysoc.uncommitted=true), and an existing tag
+#                        is moved without asking.
+# task version shows the tag a build would push and whether the registry has it.
+# CORTEX_IMAGE is pinned by tag and digest below (task build CORTEX_IMAGE=<image> builds on another
+# one); to move it, look its digest up with
+#   docker buildx imagetools inspect <image>:<tag>
+
+vars:
+  REGISTRY: reg0.dreamlab.net
+  PROJECT: cysoc
+  SERVICE: cortex
+  REPOSITORY: "{{.REGISTRY}}/{{.PROJECT}}/{{.SERVICE}}"
+
+  # The Cortex image this one is built FROM: a release of the Cortex repository's `task build`.
+  CORTEX_IMAGE: reg0.dreamlab.net/cysoc/cortex:4.1.0-1-9f1bc90-DL001@sha256:54bc815231fbde915f97a50808fdee6c4644d35ec3d125e06798fe7df8f25134
+  CORTEX_TAG: '{{splitList "@" .CORTEX_IMAGE | first | splitList ":" | last}}'
+
+  # The Elasticsearch release CySOC runs: the Elasticsearch analyzer's client is pinned to its
+  # major.minor.
+  ELASTICSEARCH_VERSION: "8.19.15"
+
+  COMMIT:
+    sh: git rev-parse HEAD
+  DIRTY:
+    sh: test -z "$(git status --porcelain)" || echo -dirty
+  RELEASE: "{{.CORTEX_TAG}}-AN-{{trunc 7 .COMMIT}}"
+
+tasks:
+  version:
+    desc: Show the tag task build would push (RELEASE, or TAG=<tag>) and whether reg0 has it
+    silent: true
+    vars:
+      VERSION: "{{.TAG | default .RELEASE}}"
+      IMAGE: "{{.REPOSITORY}}:{{.VERSION}}"
+    cmds:
+      - |
+        echo "version:  {{.VERSION}}"
+        echo "cortex:   {{.CORTEX_IMAGE}}"
+        echo "commit:   {{.COMMIT}}{{.DIRTY}}"
+        {{if .DIRTY}}echo "checkout: uncommitted changes{{if not .TAG}}: a release build refuses them{{end}}"
+        {{else}}echo "checkout: clean"{{end}}
+        if docker manifest inspect {{.IMAGE}} >/dev/null 2>&1; then
+          # Only an extra: buildx can fail where docker succeeds (it does not read certs.d).
+          digest=$(docker buildx imagetools inspect --format '{{"{{"}}.Manifest.Digest{{"}}"}}' {{.IMAGE}} 2>/dev/null || true)
+          echo "registry: {{.IMAGE}} is pushed${digest:+ ($digest)}"
+        else
+          echo "registry: {{.IMAGE}} is not pushed"
+        fi
+
+  build:
+    desc: Build and push the image as RELEASE (clean checkout, asks before moving a tag) or as TAG=<tag> (debug)
+    vars:
+      VERSION: "{{.TAG | default .RELEASE}}"
+      IMAGE: "{{.REPOSITORY}}:{{.VERSION}}"
+    preconditions:
+      - sh: '{{if and (regexMatch "^[^@]+:[^:@/]+@sha256:[0-9a-f]{64}$" .CORTEX_IMAGE) (not (hasSuffix (repeat 64 "0") .CORTEX_IMAGE))}}true{{else}}false{{end}}'
+        msg: "CORTEX_IMAGE is {{.CORTEX_IMAGE}}: give it as <image>:<tag>@sha256:<digest>"
+      - sh: '{{if .TAG}}true{{else}}test -z "{{.DIRTY}}"{{end}}'
+        msg: "uncommitted changes: commit them for a release build ({{.RELEASE}}), or build them with TAG=<tag>"
+    cmds:
+      - task: _confirm-move
+        vars: { IMAGE: "{{.IMAGE}}", TAG: "{{.TAG}}" }
+      - >-
+        DOCKER_BUILDKIT=1 docker build
+        --platform linux/amd64
+        --build-arg CORTEX_IMAGE={{.CORTEX_IMAGE}}
+        --build-arg ELASTICSEARCH_VERSION={{.ELASTICSEARCH_VERSION}}
+        --label org.opencontainers.image.title={{.SERVICE}}
+        --label org.opencontainers.image.version={{.VERSION}}
+        --label org.opencontainers.image.revision={{.COMMIT}}
+        {{if .DIRTY}}--label net.dreamlab.cysoc.uncommitted=true{{end}}
+        --label org.opencontainers.image.base.name={{.CORTEX_IMAGE}}
+        --label org.opencontainers.image.created={{now | date "2006-01-02T15:04:05Z07:00"}}
+        --tag {{.IMAGE}} .
+      - docker push {{.IMAGE}}
+
+  # Asks before a release build moves a tag the registry has; a debug build (TAG) moves it
+  # without asking.
+  _confirm-move:
+    internal: true
+    silent: true
+    prompt: "{{.IMAGE}} is already in the registry. Move it to this build?"
+    status:
+      - '{{if .TAG}}true{{else}}! docker manifest inspect {{.IMAGE}} >/dev/null 2>&1{{end}}'
+    cmds:
+      - echo "moving {{.IMAGE}}"
