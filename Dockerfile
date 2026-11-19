@@ -11,13 +11,15 @@ ARG UV_IMAGE
 FROM ${UV_IMAGE} AS uv
 
 # ---------------------------------------------------------------------------
-# The requirements.txt files alone, as installed: the install layer below is rebuilt only when one
-# of them changes, not on every change to the code.
+# The checkout, split for the layers of the image: the requirements.txt files as installed (the
+# install layer is rebuilt only when one of them changes), the files of 64 KiB or more (databases,
+# report images: pushed again only when one of them changes) and the rest (the code: a change to
+# it pushes a layer of a few MB).
 # ---------------------------------------------------------------------------
-FROM ${CORTEX_IMAGE} AS requirements
+FROM ${CORTEX_IMAGE} AS source
 
-COPY . /src
-WORKDIR /src
+COPY . /small
+WORKDIR /small
 
 # ELASTICSEARCH_VERSION pins the Elasticsearch client to its major.minor (any patch release).
 # stringsifter does not install here.
@@ -27,7 +29,9 @@ RUN test -n "$ELASTICSEARCH_VERSION" && \
     sed -i 's/stringsifter/# stringsifter/' analyzers/FileInfo/requirements.txt && \
     for f in analyzers/*/requirements.txt responders/*/requirements.txt; do \
       install -D -m 644 "$f" "/requirements/$f"; \
-    done
+    done && \
+    mkdir /large && \
+    find . -type f -size +65535c -exec sh -c 'mkdir -p "/large/${1%/*}" && mv "$1" "/large/$1"' _ {} \;
 
 # ---------------------------------------------------------------------------
 # The image
@@ -72,11 +76,14 @@ RUN pwsh -NoLogo -NoProfile -Command \
        Install-Module -Name PSWSMan -Scope AllUsers -RequiredVersion 2.3.0 -Force; \
        Install-WSMan"
 
+RUN chown root:root / /var /var/log && \
+    chmod 755 / /var /var/log
+
 # Each requirement set is installed into the system Python on its own, in directory order, so a
 # later set overrides the versions of an earlier one. A set that fails to install leaves its analyzer
 # or responder broken, not the image: the failed ones are listed at the end of the step. uv is
 # mounted for this step only; its cache lives for the step.
-COPY --from=requirements /requirements /opt/Cortex-Analyzers
+COPY --from=source /requirements /opt/Cortex-Analyzers
 WORKDIR /opt/Cortex-Analyzers
 RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
     export UV_CACHE_DIR=/tmp/uv-cache CFLAGS="-fPIC" && \
@@ -90,12 +97,7 @@ RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
     rm -rf "$UV_CACHE_DIR" && \
     echo "Requirement sets that failed to install:${failed:- none}"
 
-# The code, then the requirements as installed over their originals.
-COPY . /opt/Cortex-Analyzers
-COPY --from=requirements /requirements /opt/Cortex-Analyzers
-RUN chmod -R 755 /opt/Cortex-Analyzers && \
-    chown -R cortex:cortex /opt/Cortex-Analyzers && \
-    chown root:root / /var /var/log && \
-    chmod 755 / /var /var/log
+COPY --from=source --chown=cortex:cortex --chmod=755 /large /opt/Cortex-Analyzers
+COPY --from=source --chown=cortex:cortex --chmod=755 /small /opt/Cortex-Analyzers
 
 WORKDIR /opt/cortex
