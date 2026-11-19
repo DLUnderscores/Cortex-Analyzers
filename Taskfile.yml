@@ -10,8 +10,8 @@ version: "3"
 #                        image is labelled net.dreamlab.cysoc.uncommitted=true), and an existing tag
 #                        is moved without asking.
 # task version shows the tag a build would push and whether the registry has it.
-# CORTEX_IMAGE is pinned by tag and digest below (task build CORTEX_IMAGE=<image> builds on another
-# one); to move it, look its digest up with
+# CORTEX_IMAGE and UV_IMAGE are pinned by tag and digest below (task build CORTEX_IMAGE=<image>
+# builds on another Cortex); to move one, look its digest up with
 #   docker buildx imagetools inspect <image>:<tag>
 
 vars:
@@ -23,6 +23,9 @@ vars:
   # The Cortex image this one is built FROM: a release of the Cortex repository's `task build`.
   CORTEX_IMAGE: reg0.dreamlab.net/cysoc/cortex:4.1.0-1-9f1bc90-DL001@sha256:54bc815231fbde915f97a50808fdee6c4644d35ec3d125e06798fe7df8f25134
   CORTEX_TAG: '{{splitList "@" .CORTEX_IMAGE | first | splitList ":" | last}}'
+
+  # uv installs the analyzers' and responders' Python requirements; only the build uses it.
+  UV_IMAGE: ghcr.io/astral-sh/uv:0.13.7@sha256:96f40d3904aad8d0bd010539001d36c8e2188b981e1334471a90c4a1d93bb490
 
   # The Elasticsearch release CySOC runs: the Elasticsearch analyzer's client is pinned to its
   # major.minor.
@@ -73,6 +76,7 @@ tasks:
         DOCKER_BUILDKIT=1 docker build
         --platform linux/amd64
         --build-arg CORTEX_IMAGE={{.CORTEX_IMAGE}}
+        --build-arg UV_IMAGE={{.UV_IMAGE}}
         --build-arg ELASTICSEARCH_VERSION={{.ELASTICSEARCH_VERSION}}
         --label org.opencontainers.image.title={{.SERVICE}}
         --label org.opencontainers.image.version={{.VERSION}}

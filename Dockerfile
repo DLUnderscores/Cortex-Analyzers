@@ -2,11 +2,36 @@
 
 # Cortex with these analyzers and responders in /opt/Cortex-Analyzers, run by Cortex's process
 # runner. Built from this checkout by `task build`, which passes the build arguments; the Taskfile
-# pins the Cortex image.
+# pins the images.
 
-# The Cortex image: <image>:<tag>@<digest>.
+# The Cortex image and the uv image: <image>:<tag>@<digest>.
 ARG CORTEX_IMAGE
+ARG UV_IMAGE
 
+FROM ${UV_IMAGE} AS uv
+
+# ---------------------------------------------------------------------------
+# The requirements.txt files alone, as installed: the install layer below is rebuilt only when one
+# of them changes, not on every change to the code.
+# ---------------------------------------------------------------------------
+FROM ${CORTEX_IMAGE} AS requirements
+
+COPY . /src
+WORKDIR /src
+
+# ELASTICSEARCH_VERSION pins the Elasticsearch client to its major.minor (any patch release).
+# stringsifter does not install here.
+ARG ELASTICSEARCH_VERSION
+RUN test -n "$ELASTICSEARCH_VERSION" && \
+    sed -i "s/elasticsearch.*/elasticsearch~=${ELASTICSEARCH_VERSION%.*}/" analyzers/Elasticsearch/requirements.txt && \
+    sed -i 's/stringsifter/# stringsifter/' analyzers/FileInfo/requirements.txt && \
+    for f in analyzers/*/requirements.txt responders/*/requirements.txt; do \
+      install -D -m 644 "$f" "/requirements/$f"; \
+    done
+
+# ---------------------------------------------------------------------------
+# The image
+# ---------------------------------------------------------------------------
 FROM ${CORTEX_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -47,30 +72,30 @@ RUN pwsh -NoLogo -NoProfile -Command \
        Install-Module -Name PSWSMan -Scope AllUsers -RequiredVersion 2.3.0 -Force; \
        Install-WSMan"
 
-COPY . /opt/Cortex-Analyzers
+# Each requirement set is installed into the system Python on its own, in directory order, so a
+# later set overrides the versions of an earlier one. A set that fails to install leaves its analyzer
+# or responder broken, not the image: the failed ones are listed at the end of the step. uv is
+# mounted for this step only; its cache lives for the step.
+COPY --from=requirements /requirements /opt/Cortex-Analyzers
 WORKDIR /opt/Cortex-Analyzers
+RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
+    export UV_CACHE_DIR=/tmp/uv-cache CFLAGS="-fPIC" && \
+    failed="" && \
+    for f in analyzers/*/requirements.txt responders/*/requirements.txt; do \
+      echo "Installing requirements for ${f%/requirements.txt}..." && \
+      uv pip install --system --break-system-packages -r "$f" || \
+        { echo "WARNING: Failed to install requirements for ${f%/requirements.txt}, continuing..."; \
+          failed="$failed ${f%/requirements.txt}"; }; \
+    done && \
+    rm -rf "$UV_CACHE_DIR" && \
+    echo "Requirement sets that failed to install:${failed:- none}"
 
-# ELASTICSEARCH_VERSION pins the Elasticsearch client to its major.minor (any patch release).
-# stringsifter does not install here.
-ARG ELASTICSEARCH_VERSION
-RUN test -n "$ELASTICSEARCH_VERSION" && \
-    sed -i "s/elasticsearch.*/elasticsearch~=${ELASTICSEARCH_VERSION%.*}/" analyzers/Elasticsearch/requirements.txt && \
-    sed -i 's/stringsifter/# stringsifter/' analyzers/FileInfo/requirements.txt && \
-    chmod -R 755 /opt/Cortex-Analyzers && \
-    chown -R cortex:cortex /opt/Cortex-Analyzers
-
-# A requirement set that fails to install leaves its analyzer or responder broken, not the image.
-RUN for dir in analyzers responders; do \
-      for subdir in $(ls $dir); do \
-        if [ -f "$dir/$subdir/requirements.txt" ]; then \
-          echo "Installing requirements for $dir/$subdir..." && \
-          (CFLAGS="-fPIC" pip3 install --no-cache-dir --break-system-packages -r "$dir/$subdir/requirements.txt" || \
-          echo "WARNING: Failed to install requirements for $dir/$subdir, continuing..."); \
-        fi; \
-      done; \
-    done
-
-RUN chown root:root / /var /var/log && \
+# The code, then the requirements as installed over their originals.
+COPY . /opt/Cortex-Analyzers
+COPY --from=requirements /requirements /opt/Cortex-Analyzers
+RUN chmod -R 755 /opt/Cortex-Analyzers && \
+    chown -R cortex:cortex /opt/Cortex-Analyzers && \
+    chown root:root / /var /var/log && \
     chmod 755 / /var /var/log
 
 WORKDIR /opt/cortex
